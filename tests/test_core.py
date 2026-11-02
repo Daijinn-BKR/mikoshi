@@ -5,8 +5,8 @@ import subprocess
 import pytest
 from PIL import Image
 
-from catalogo import metadata, scanner
-from catalogo.db import Catalog, effective
+from mikoshi import metadata, scanner
+from mikoshi.db import Catalog, _migrate_old_data, data_dir, effective
 
 needs_ffmpeg = pytest.mark.skipif(not shutil.which("ffmpeg"), reason="requiere ffmpeg")
 
@@ -207,6 +207,36 @@ def test_unwritable_format_rejected(lib):
     path.write_bytes(b"x")
     with pytest.raises(metadata.MetadataError):
         metadata.write_file(str(path), "document", {"title": "x"})
+
+
+def test_old_data_folder_is_migrated(tmp_path):
+    (tmp_path / "CatalogoMultimedia").mkdir()
+    (tmp_path / "CatalogoMultimedia" / "catalogo.db").write_bytes(b"datos")
+    path = _migrate_old_data(tmp_path)
+    assert path == tmp_path / "Mikoshi"
+    assert (path / "catalogo.db").read_bytes() == b"datos"
+    assert not (tmp_path / "CatalogoMultimedia").exists()
+
+
+def test_existing_new_catalog_is_not_overwritten(tmp_path):
+    for name in ("CatalogoMultimedia", "Mikoshi"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "catalogo.db").write_bytes(name.encode())
+    assert _migrate_old_data(tmp_path) == tmp_path / "Mikoshi"
+    assert (tmp_path / "Mikoshi" / "catalogo.db").read_bytes() == b"Mikoshi"
+    assert (tmp_path / "CatalogoMultimedia" / "catalogo.db").exists()
+
+
+def test_new_folder_without_catalog_does_not_hide_old_one(tmp_path):
+    (tmp_path / "CatalogoMultimedia").mkdir()
+    (tmp_path / "CatalogoMultimedia" / "catalogo.db").write_bytes(b"datos")
+    (tmp_path / "Mikoshi" / "portadas").mkdir(parents=True)
+    path = _migrate_old_data(tmp_path)
+    assert (path / "catalogo.db").read_bytes() == b"datos"
+
+
+def test_tests_are_isolated_from_real_data(tmp_path):
+    assert data_dir() == tmp_path / "datos"
 
 
 def test_effective_overlays_edits():

@@ -1,4 +1,4 @@
-# Catálogo Multimedia
+# Mikoshi
 
 App de escritorio para catalogar películas, música, fotos, libros y juegos que
 están en una carpeta local o de red.
@@ -10,16 +10,40 @@ Requiere Python 3.12 o superior. `ffmpeg` es necesario para los vídeos.
 ```bash
 python -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
-.venv\Scripts\python -m catalogo
+.venv\Scripts\python -m mikoshi
 ```
 
-En Windows también se puede abrir con `Abrir catalogo.bat`. Pruebas:
+En Windows también se puede abrir con `Abrir Mikoshi.bat`. Pruebas:
 `.venv\Scripts\python -m pytest tests`.
+
+## Crear el programa
+
+`powershell -ExecutionPolicy Bypass -File packaging\build.ps1` genera
+`dist\Mikoshi\Mikoshi.exe`. Si Inno Setup 6 está instalado, también crea el
+instalador en `dist`. El reproductor va incluido, pero leer datos de vídeo, crear
+sus miniaturas y escribir en ellos sigue necesitando `ffmpeg` en el PATH.
+
+## Funciones
+
+- **Datos de internet:** TMDB (películas y series), MusicBrainz (música), Open
+  Library (libros) y RAWG (juegos). TMDB y RAWG piden una clave gratuita en
+  *Archivo > Ajustes*. Solo se conecta cuando pulsas *Buscar en internet*.
+- **Edición masiva:** selecciona varios elementos y pulsa *Editar varios*. Solo
+  cambia los campos marcados y solo en el catálogo.
+- **Organización:** colecciones, series, álbumes y filtros por valoración, género
+  y año.
+- **Mantenimiento:** *Comprobar integridad* detecta archivos dañados comparando
+  huellas SHA-256; *Buscar duplicados* encuentra contenido idéntico. Ninguno
+  modifica ni borra archivos.
+- **Copia automática:** al cerrar, como máximo una vez al día, en la carpeta
+  elegida en *Ajustes*. Las copias incluyen las claves de los servicios.
+- **Reproductor:** vídeo, música y fotos dentro de la app, con *Abrir fuera* para
+  lo que no pueda reproducir.
 
 ## Cómo guarda los datos
 
 - El catálogo, las miniaturas y las portadas están en
-  `%LOCALAPPDATA%\CatalogoMultimedia`, no en el servidor, porque SQLite no es
+  `%LOCALAPPDATA%\Mikoshi`, no en el servidor, porque SQLite no es
   fiable en carpetas de red. *Archivo > Copia del catálogo* lo copia al servidor.
 - Editar solo cambia el catálogo. Los archivos cambian únicamente con
   *Escribir en archivo*, y nunca se borran.

@@ -1,1 +1,0 @@
-"""Catálogo de colección multimedia."""

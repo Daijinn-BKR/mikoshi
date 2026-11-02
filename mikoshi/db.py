@@ -47,15 +47,51 @@ CREATE TABLE IF NOT EXISTS item_tags (
     PRIMARY KEY (item_id, tag_id)
 );
 CREATE INDEX IF NOT EXISTS idx_items_kind ON items(kind);
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS collections (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE
+);
+CREATE TABLE IF NOT EXISTS collection_items (
+    collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    PRIMARY KEY (collection_id, item_id)
+);
 """
+
+# Columnas añadidas después de la primera versión: las bases existentes las reciben al abrir.
+NEW_ITEM_COLUMNS = {
+    "checksum": "TEXT NOT NULL DEFAULT ''",
+    "checksum_mtime": "REAL NOT NULL DEFAULT 0",
+}
+GROUP_FIELDS = {"series", "album"}
 
 
 def data_dir() -> Path:
-    base = os.environ.get("CATALOGO_DATA") or os.environ.get("LOCALAPPDATA")
-    path = Path(base) if base else Path.home() / ".local" / "share"
-    if not os.environ.get("CATALOGO_DATA"):
-        path = path / "CatalogoMultimedia"
+    custom = os.environ.get("MIKOSHI_DATA")
+    if custom:
+        path = Path(custom)
+    else:
+        base = os.environ.get("LOCALAPPDATA")
+        parent = Path(base) if base else Path.home() / ".local" / "share"
+        path = _migrate_old_data(parent)
     path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _migrate_old_data(parent: Path) -> Path:
+    """Conserva el catálogo creado cuando la app se llamaba Catálogo Multimedia."""
+    path, old = parent / "Mikoshi", parent / "CatalogoMultimedia"
+    if (old / "catalogo.db").exists() and not (path / "catalogo.db").exists():
+        try:
+            old.rename(path)
+        except OSError:
+            # Carpeta en uso o destino ocupado: se sigue usando la antigua para no
+            # mostrar un catálogo vacío. Se reintentará en el próximo arranque.
+            return old
     return path
 
 
@@ -91,10 +127,26 @@ class Catalog:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.executescript(SCHEMA)
+        existing = {r["name"] for r in self.conn.execute("PRAGMA table_info(items)")}
+        for column, definition in NEW_ITEM_COLUMNS.items():
+            if column not in existing:
+                self.conn.execute(f"ALTER TABLE items ADD COLUMN {column} {definition}")
         self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
+
+    # Ajustes
+
+    def setting(self, key: str, default: str = "") -> str:
+        row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO settings VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value)
+        )
+        self.conn.commit()
 
     # Carpetas raíz
 
@@ -179,8 +231,29 @@ class Catalog:
         "FROM items i JOIN roots r ON r.id = i.root_id"
     )
 
-    def query_items(self, kind=None, tag=None, root_id=None, status=None, text=None) -> list[dict]:
+    @staticmethod
+    def _group_sql(field: str) -> str:
+        if field not in GROUP_FIELDS:
+            raise ValueError(field)
+        return f"coalesce(json_extract(i.edits, '$.{field}'), json_extract(i.file_meta, '$.{field}'))"
+
+    def group_names(self, field: str) -> list[str]:
+        """Series o álbumes distintos, para agrupar episodios y pistas."""
+        expr = self._group_sql(field)
+        rows = self.conn.execute(
+            f"SELECT DISTINCT {expr} AS name FROM items i WHERE {expr} <> '' ORDER BY name COLLATE NOCASE"
+        )
+        return [r["name"] for r in rows]
+
+    def query_items(self, kind=None, tag=None, root_id=None, status=None, text=None,
+                    collection=None, group=None) -> list[dict]:
         where, args = [], []
+        if collection:
+            where.append("i.id IN (SELECT item_id FROM collection_items WHERE collection_id = ?)")
+            args.append(collection)
+        if group:
+            where.append(f"{self._group_sql(group[0])} = ?")
+            args.append(group[1])
         if kind:
             where.append("i.kind = ?")
             args.append(kind)
@@ -213,6 +286,55 @@ class Catalog:
                 "UPDATE items SET edits = ? WHERE id = ?",
                 (json.dumps(edits, ensure_ascii=False), item_id),
             )
+        self.conn.commit()
+
+    def bulk_edit(self, item_ids, fields: dict) -> None:
+        """Aplica los mismos campos a varios elementos, solo en el catálogo."""
+        for item_id in item_ids:
+            item = self.get_item(item_id)
+            edits = dict(item["edits"])
+            for key, value in fields.items():
+                if value != item["file_meta"].get(key, ""):
+                    edits[key] = value
+                else:
+                    edits.pop(key, None)
+            self.conn.execute(
+                "UPDATE items SET edits = ? WHERE id = ?", (json.dumps(edits, ensure_ascii=False), item_id)
+            )
+        self.conn.commit()
+
+    def set_checksum(self, item_id: int, checksum: str, mtime: float) -> None:
+        self.conn.execute(
+            "UPDATE items SET checksum = ?, checksum_mtime = ? WHERE id = ?", (checksum, mtime, item_id)
+        )
+        self.conn.commit()
+
+    # Colecciones
+
+    def collections(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute("SELECT * FROM collections ORDER BY name COLLATE NOCASE")]
+
+    def create_collection(self, name: str) -> int:
+        self.conn.execute("INSERT OR IGNORE INTO collections (name) VALUES (?)", (name.strip(),))
+        self.conn.commit()
+        return self.conn.execute("SELECT id FROM collections WHERE name = ?", (name.strip(),)).fetchone()["id"]
+
+    def delete_collection(self, collection_id: int) -> None:
+        """Borra la colección; sus elementos siguen en el catálogo."""
+        self.conn.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
+        self.conn.commit()
+
+    def add_to_collection(self, collection_id: int, item_ids) -> None:
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO collection_items VALUES (?, ?)", [(collection_id, i) for i in item_ids]
+        )
+        self.conn.commit()
+
+    def remove_from_collection(self, collection_id: int, item_ids) -> None:
+        self.conn.executemany(
+            "DELETE FROM collection_items WHERE collection_id = ? AND item_id = ?",
+            [(collection_id, i) for i in item_ids],
+        )
         self.conn.commit()
 
     def set_rating(self, item_ids, rating: int) -> None:
@@ -254,11 +376,14 @@ class Catalog:
     def backup_to(self, folder: str) -> str:
         """Copia consistente del catálogo y las portadas, por ejemplo al servidor."""
         dest = os.path.join(folder, "catalogo.db")
-        target = sqlite3.connect(dest)
+        temp = dest + ".tmp"
+        target = sqlite3.connect(temp)
         try:
             self.conn.backup(target)
         finally:
             target.close()
+        # Si la red falla a medias, la copia anterior sigue siendo válida.
+        os.replace(temp, dest)
         covers = covers_dir()
         if any(covers.iterdir()):
             shutil.copytree(covers, os.path.join(folder, "portadas"), dirs_exist_ok=True)

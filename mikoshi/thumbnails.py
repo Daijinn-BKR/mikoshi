@@ -3,13 +3,12 @@ from __future__ import annotations
 
 import hashlib
 import io
-import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from .db import data_dir, full_path
+from .db import covers_dir, data_dir, full_path
 
 SIZE = (240, 240)
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -71,8 +70,10 @@ def thumbnail_for(item: dict) -> str | None:
         return str(dest)
     path = full_path(item)
     try:
-        if item["cover"] and os.path.exists(item["cover"]):
-            _save(item["cover"], dest)
+        # La portada se busca por nombre: la carpeta de datos pudo cambiar de sitio.
+        cover = covers_dir() / Path(item["cover"]).name if item["cover"] else None
+        if cover and cover.exists():
+            _save(cover, dest)
         elif item["kind"] == "image":
             _save(path, dest)
         elif item["kind"] == "audio":

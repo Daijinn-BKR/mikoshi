@@ -16,7 +16,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
-TEMP_PREFIX = ".tmp-catalogo-"
+TEMP_PREFIX = ".tmp-mikoshi-"
 
 KIND_LABELS = {
     "video": "Películas y series",
