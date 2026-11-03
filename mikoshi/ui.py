@@ -766,7 +766,10 @@ class MainWindow(QMainWindow):
             self.now_playing.play(audio, audio.index(item))
             return
         self.now_playing.pause()
-        PlayerDialog(items, index, open_path, self, hooks=PlayerHooks(self.catalog, resume)).exec()
+        dialog = PlayerDialog(items, index, open_path, self, hooks=PlayerHooks(self.catalog, resume))
+        dialog.exec()
+        # Se libera al cerrar: cada reproductor tiene su propio decodificador y su filtro de eventos.
+        dialog.deleteLater()
 
     def edit_item(self, item_id: int) -> None:
         item = self.catalog.get_item(item_id)

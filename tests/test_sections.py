@@ -640,7 +640,7 @@ def test_escape_and_double_click_toggle_fullscreen(window):
     favorites = favorites_with_root(window)
     favorites.watch(favorites.model.items, 0)
     player = favorites.player
-    QTest.mouseDClick(player.video, Qt.MouseButton.LeftButton)
+    QTest.mouseDClick(player.video.viewport(), Qt.MouseButton.LeftButton)
     assert player.immersive
     QTest.keyClick(player.video, Qt.Key.Key_Escape)
     assert not player.immersive
@@ -668,4 +668,55 @@ def test_clicking_progress_bar_jumps_there(window):
     bar = player.position
     QTest.mouseClick(bar, Qt.MouseButton.LeftButton, pos=QPoint(bar.width() // 2, bar.height() // 2))
     wait_until(lambda: abs(player.player.position() - player.player.duration() // 2) < player.player.duration() * 0.15)
+    favorites._back()
+
+
+
+def test_controls_float_over_the_video_and_hide_while_playing(window, monkeypatch):
+    from PySide6.QtTest import QTest
+
+    favorites = favorites_with_root(window)
+    favorites.watch(favorites.model.items, 0)
+    player = favorites.player
+    player.hide_timer.setInterval(200)
+    # Los controles están dentro de la zona del vídeo, en su parte de abajo, no debajo de ella.
+    assert player.controls.parent() is player.stage_box
+    assert player.controls.geometry().bottom() == player.stage_box.rect().bottom()
+    assert player.stage.geometry() == player.stage_box.rect()
+    wait_until(lambda: player.player.playbackState() == player.player.PlaybackState.PlayingState)
+    player.poke()
+    wait_until(lambda: not player.controls.isVisible(), 3000)
+    assert player.video.viewport().cursor().shape() == Qt.CursorShape.BlankCursor
+    QTest.keyClick(player.video, Qt.Key.Key_A)
+    assert player.controls.isVisible()
+    assert player.video.viewport().cursor().shape() != Qt.CursorShape.BlankCursor
+    wait_until(lambda: not player.controls.isVisible(), 3000)
+    player.toggle()
+    assert player.controls.isVisible()
+    QTest.qWait(500)
+    assert player.controls.isVisible(), "en pausa los controles no se ocultan"
+    favorites._back()
+
+
+def test_controls_stay_for_images_and_messages(window):
+    from mikoshi.player import PlayerWidget
+
+    image = next(i for i in window.catalog.query_items() if i["kind"] == "video")
+    broken = dict(image, rel_path="no-existe.mp4")
+    widget = PlayerWidget([broken], 0, lambda p: None)
+    widget.show()
+    widget.hide_timer.setInterval(50)
+    widget.poke()
+    QTest_wait = __import__("PySide6.QtTest", fromlist=["QTest"]).QTest
+    QTest_wait.qWait(200)
+    assert widget.controls.isVisible()
+    widget.close()
+
+
+def test_video_frames_are_drawn_in_layered_view(window):
+    favorites = favorites_with_root(window)
+    favorites.watch(favorites.model.items, 0)
+    player = favorites.player
+    wait_until(lambda: not player.video.item.nativeSize().isEmpty())
+    assert player.video.item.size().width() == player.video.viewport().width()
     favorites._back()

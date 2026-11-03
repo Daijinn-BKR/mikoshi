@@ -4,17 +4,28 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl, Signal
-from PySide6.QtGui import QImageReader, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QEvent, QSizeF, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QBrush, QColor, QCursor, QImageReader, QKeySequence, QPixmap, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from PySide6.QtWidgets import (
-    QDialog, QHBoxLayout, QLabel, QPushButton, QSlider, QStackedWidget, QStyle, QVBoxLayout, QWidget,
+    QApplication, QDialog, QFrame, QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel, QPushButton, QSlider,
+    QStackedWidget, QStyle, QVBoxLayout, QWidget,
 )
 
 from .db import display_title, full_path
 
 PLAYABLE = {"video", "audio", "image"}
+HIDE_CONTROLS_AFTER_MS = 2500
+
+# Controles sobre el vídeo, como en YouTube: transparentes, con un degradado oscuro para leerse.
+OVERLAY_STYLE = """
+#overlay { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(0,0,0,0), stop:1 rgba(0,0,0,200)); }
+#overlay QPushButton { background: transparent; border: none; color: white; padding: 6px 10px; font-weight: 600; }
+#overlay QPushButton:hover { background: rgba(255,255,255,40); border-radius: 4px; }
+#overlay QPushButton:disabled { color: rgba(255,255,255,80); }
+#overlay QLabel { color: white; background: transparent; }
+"""
 
 
 def format_time(ms: int) -> str:
@@ -74,15 +85,42 @@ class SeekSlider(QSlider):
         super().mousePressEvent(event)
 
 
-class VideoSurface(QVideoWidget):
-    """Imagen del vídeo. Doble clic, F o F11 cambian a pantalla completa; Esc sale."""
+class VideoView(QGraphicsView):
+    """Imagen del vídeo. A diferencia de una superficie nativa, admite controles dibujados encima.
+
+    Doble clic, F o F11 cambian a pantalla completa; Esc sale; Espacio pausa; las flechas saltan 10 s.
+    """
 
     def __init__(self, owner, parent=None):
         super().__init__(parent)
         self.owner = owner
+        self.setScene(QGraphicsScene(self))
+        self.item = QGraphicsVideoItem()
+        self.scene().addItem(self.item)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setBackgroundBrush(QBrush(QColor("black")))
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.item.nativeSizeChanged.connect(lambda _size: self._fit())
+
+    def _fit(self) -> None:
+        size = self.viewport().size()
+        self.item.setSize(QSizeF(size))
+        self.scene().setSceneRect(0, 0, size.width(), size.height())
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit()
 
     def mouseDoubleClickEvent(self, event) -> None:
         self.owner.toggle_fullscreen()
+
+    def mousePressEvent(self, event) -> None:
+        self.setFocus()
+        self.owner.poke()
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
@@ -114,7 +152,7 @@ class PlayerWidget(QWidget):
         self.saved_margins: list = []
         self.saved_window_state = None
 
-        self.video = VideoSurface(self)
+        self.video = VideoView(self)
         self.picture = QLabel(alignment=Qt.AlignmentFlag.AlignCenter)
         self.picture.setMinimumSize(1, 1)
         self.message = QLabel(alignment=Qt.AlignmentFlag.AlignCenter, wordWrap=True)
@@ -126,7 +164,7 @@ class PlayerWidget(QWidget):
         self.audio = QAudioOutput(self)
         self.player = QMediaPlayer(self)
         self.player.setAudioOutput(self.audio)
-        self.player.setVideoOutput(self.video)
+        self.player.setVideoOutput(self.video.item)
 
         self.previous_button = QPushButton("◀◀")
         self.play_button = QPushButton("Pausa")
@@ -136,27 +174,42 @@ class PlayerWidget(QWidget):
         self.fullscreen_button.setToolTip("También con doble clic o la tecla F. Esc para salir.")
         self.position = SeekSlider()
         self.time_label = QLabel("0:00 / 0:00")
-        self.time_label.setProperty("muted", True)
         self.volume = QSlider(Qt.Orientation.Horizontal)
         self.volume.setRange(0, 100)
         self.volume.setValue(80)
         self.volume.setFixedWidth(100)
         self.audio.setVolume(0.8)
 
-        controls = QHBoxLayout()
-        for widget in (self.previous_button, self.play_button, self.next_button):
-            controls.addWidget(widget)
-        controls.addWidget(self.position, 1)
-        controls.addWidget(self.time_label)
-        controls.addWidget(QLabel("Vol."))
-        controls.addWidget(self.volume)
-        controls.addWidget(self.fullscreen_button)
-        controls.addWidget(self.external_button)
+        # La barra de progreso ocupa todo el ancho y los botones van debajo, sobre el propio vídeo.
+        self.stage_box = QWidget()
+        self.stage.setParent(self.stage_box)
+        self.controls = QWidget(self.stage_box)
+        self.controls.setObjectName("overlay")
+        self.controls.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        self.controls.setStyleSheet(OVERLAY_STYLE)
+        buttons = QHBoxLayout()
+        for widget in (self.previous_button, self.play_button, self.next_button, self.time_label):
+            buttons.addWidget(widget)
+        buttons.addStretch()
+        buttons.addWidget(QLabel("Vol."))
+        buttons.addWidget(self.volume)
+        buttons.addWidget(self.fullscreen_button)
+        buttons.addWidget(self.external_button)
+        overlay = QVBoxLayout(self.controls)
+        overlay.setContentsMargins(12, 24, 12, 6)
+        overlay.setSpacing(2)
+        overlay.addWidget(self.position)
+        overlay.addLayout(buttons)
+        self.stage_box.installEventFilter(self)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self.stage, 1)
-        layout.addLayout(controls)
+        layout.addWidget(self.stage_box, 1)
+
+        self.hide_timer = QTimer(self)
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.setInterval(HIDE_CONTROLS_AFTER_MS)
+        self.hide_timer.timeout.connect(self._auto_hide)
 
         self.previous_button.clicked.connect(lambda: self.go(-1))
         self.next_button.clicked.connect(lambda: self.go(1))
@@ -181,6 +234,58 @@ class PlayerWidget(QWidget):
     @property
     def item(self) -> dict:
         return self.items[self.index]
+
+    # Controles que se ocultan solos. Solo se escucha el teclado y el ratón mientras el reproductor
+    # está a la vista: así no frena al resto de la aplicación.
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        QApplication.instance().installEventFilter(self)
+
+    def hideEvent(self, event) -> None:
+        QApplication.instance().removeEventFilter(self)
+        self.hide_timer.stop()
+        super().hideEvent(event)
+
+    def eventFilter(self, watched, event) -> bool:
+        kind = event.type()
+        if watched is self.stage_box and kind == QEvent.Type.Resize:
+            self._place_controls()
+        elif kind == QEvent.Type.KeyPress and self.isVisible():
+            self.poke()
+        elif kind == QEvent.Type.MouseMove and self.isVisible() and self._mouse_over_video():
+            self.poke()
+        return False
+
+    def _mouse_over_video(self) -> bool:
+        return self.stage_box.rect().contains(self.stage_box.mapFromGlobal(QCursor.pos()))
+
+    def _place_controls(self) -> None:
+        rect = self.stage_box.rect()
+        self.stage.setGeometry(rect)
+        height = self.controls.sizeHint().height()
+        self.controls.setGeometry(0, rect.height() - height, rect.width(), height)
+        self.controls.raise_()
+
+    def _should_hide(self) -> bool:
+        playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        return (playing and self.stage.currentWidget() is self.video and not self.seeking
+                and not self.controls.underMouse())
+
+    def poke(self) -> None:
+        """Hubo actividad: se muestran los controles y vuelve a contar el tiempo para ocultarlos."""
+        self.controls.show()
+        self.video.viewport().unsetCursor()
+        if self._should_hide() or self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.hide_timer.start()
+
+    def _auto_hide(self) -> None:
+        if self._should_hide():
+            self.controls.hide()
+            self.video.viewport().setCursor(Qt.CursorShape.BlankCursor)
+        elif self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            # El ratón está sobre los controles o se está arrastrando la barra: se vuelve a intentar.
+            self.hide_timer.start()
 
     def set_queue(self, items: list[dict], index: int) -> None:
         self.items, self.index = items, index
@@ -325,6 +430,10 @@ class PlayerWidget(QWidget):
     def _state_changed(self, state) -> None:
         playing = state == QMediaPlayer.PlaybackState.PlayingState
         self.play_button.setText("Pausa" if playing else "Reproducir")
+        # En pausa los controles se quedan a la vista; al reproducir, se ocultan tras un rato.
+        self.poke()
+        if not playing:
+            self.hide_timer.stop()
 
     def _status_changed(self, status) -> None:
         if status in (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia) and self.pending_seek:
