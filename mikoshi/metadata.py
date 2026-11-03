@@ -11,12 +11,15 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
 TEMP_PREFIX = ".tmp-mikoshi-"
+REPLACE_ATTEMPTS = 10
+REPLACE_WAIT = 0.5
 
 KIND_LABELS = {
     "video": "Películas y series",
@@ -28,19 +31,21 @@ KIND_LABELS = {
 
 # Campos editables de cada tipo, en orden de formulario.
 FIELDS = {
-    "video": [("title", "Título"), ("year", "Año"), ("genre", "Género"), ("director", "Director"),
-              ("series", "Serie"), ("season", "Temporada"), ("episode", "Episodio"),
+    "video": [("title", "Título"), ("category", "Clasificación"), ("year", "Año"), ("genre", "Género"),
+              ("director", "Director"), ("series", "Serie"), ("season", "Temporada"), ("episode", "Episodio"),
               ("description", "Descripción")],
     "audio": [("title", "Título"), ("artist", "Artista"), ("album", "Álbum"), ("year", "Año"),
               ("track", "Pista"), ("genre", "Género")],
     "image": [("title", "Título"), ("artist", "Autor"), ("date", "Fecha"), ("description", "Descripción")],
-    "document": [("title", "Título"), ("author", "Autor"), ("year", "Año"), ("publisher", "Editorial"),
-                 ("genre", "Género"), ("description", "Descripción")],
+    "document": [("title", "Título"), ("author", "Autor"), ("saga", "Serie"), ("year", "Año"),
+                 ("publisher", "Editorial"), ("genre", "Género"), ("description", "Descripción")],
     "game": [("title", "Título"), ("platform", "Plataforma"), ("year", "Año"), ("developer", "Desarrollador"),
              ("genre", "Género"), ("description", "Descripción")],
 }
 
 CREATOR_KEYS = ("artist", "author", "director", "developer")
+# Campos con opciones fijas: (valor guardado, texto visible). "" es automático.
+CHOICES = {"category": [("", "Automática"), ("movie", "Película"), ("series", "Episodio de serie")]}
 
 _EASY_AUDIO = {"title": "title", "artist": "artist", "album": "album", "year": "date",
                "track": "tracknumber", "genre": "genre"}
@@ -72,6 +77,15 @@ def writable_fields(path: str, kind: str) -> set[str]:
     if kind == "image" and ext in {".jpg", ".jpeg"}:
         return {"title", "artist", "description"}
     return set()
+
+
+def verify_in_file(item: dict, path: str) -> list[tuple[str, str, str, bool]]:
+    """Lee el archivo ahora y compara cada campo escribible con lo que muestra el catálogo."""
+    current, _ = read_file(path, item["kind"])
+    shown = {**item["file_meta"], **item["edits"]}
+    labels = dict(FIELDS[item["kind"]])
+    return [(labels[key], shown.get(key, ""), current.get(key, ""), shown.get(key, "") == current.get(key, ""))
+            for key, _label in FIELDS[item["kind"]] if key in writable_fields(path, item["kind"])]
 
 
 def pending_edits(item: dict, path: str) -> dict:
@@ -277,13 +291,25 @@ def write_file(path: str, kind: str, fields: dict) -> None:
         else:
             shutil.copy2(path, temp)
             (_write_audio if kind == "audio" else _write_image)(str(temp), fields)
-        os.replace(temp, path)
+        _replace_with_retry(temp, path)
     except MetadataError:
         raise
     except Exception as exc:
         raise MetadataError(str(exc)) from exc
     finally:
         temp.unlink(missing_ok=True)
+
+
+def _replace_with_retry(temp, path, attempts: int = REPLACE_ATTEMPTS) -> None:
+    # Windows bloquea un archivo abierto: una miniatura o OneDrive pueden tenerlo un momento.
+    for attempt in range(attempts):
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(REPLACE_WAIT)
 
 
 def _write_audio(temp: str, fields: dict) -> None:

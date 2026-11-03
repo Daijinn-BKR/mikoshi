@@ -102,17 +102,22 @@ def apply_edits_to_file(catalog: Catalog, item: dict) -> list[str]:
     Solo deja de ser edición lo que se relee igual del archivo: si un formato no
     conserva un campo, el valor sigue a salvo en el catálogo y se devuelve su nombre.
     """
+    return write_and_verify(catalog, item)[1]
+
+
+def write_and_verify(catalog: Catalog, item: dict) -> tuple[list[str], list[str]]:
+    """Como apply_edits_to_file, pero devuelve (campos confirmados al releer, campos rechazados)."""
     path = full_path(item)
     pending = metadata.pending_edits(item, path)
     if not pending:
-        return []
+        return [], []
     metadata.write_file(path, item["kind"], pending)
     stat = os.stat(path)
     fields, technical = metadata.read_file(path, item["kind"])
     catalog.refresh_from_file(item["id"], stat.st_size, stat.st_mtime, fields, technical)
     edits = {k: v for k, v in item["edits"].items() if k not in pending or fields.get(k, "") != v}
     catalog.save_user_data(item["id"], edits=edits)
-    return [k for k in pending if k in edits]
+    return [k for k in pending if k not in edits], [k for k in pending if k in edits]
 
 
 def scan_root(catalog: Catalog, root_id: int, progress=None, cancelled=None) -> ScanResult:

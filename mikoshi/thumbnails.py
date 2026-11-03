@@ -6,11 +6,13 @@ import io
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .db import covers_dir, data_dir, full_path
 
-SIZE = (240, 240)
+SIZE = (400, 400)
+CACHE_VERSION = "2"
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
@@ -60,11 +62,21 @@ def _video_frame(path: str, dest: Path) -> bool:
     return out.returncode == 0 and dest.exists()
 
 
+def save_cover(catalog, item: dict, data: bytes, suffix: str = ".jpg") -> str:
+    """Guarda una portada propia y borra la anterior. Un nombre nuevo fuerza otra miniatura."""
+    dest = covers_dir() / f"{item['id']}-{time.time_ns()}{suffix}"
+    dest.write_bytes(data)
+    if item["cover"]:
+        (covers_dir() / Path(item["cover"]).name).unlink(missing_ok=True)
+    catalog.save_user_data(item["id"], cover=str(dest))
+    return str(dest)
+
+
 def thumbnail_for(item: dict) -> str | None:
     """Ruta de la miniatura, creándola si hace falta. None si no hay imagen posible."""
     cache = data_dir() / "miniaturas"
     cache.mkdir(exist_ok=True)
-    key = f"{item['id']}|{item['mtime']}|{item['cover']}"
+    key = f"{CACHE_VERSION}|{item['id']}|{item['mtime']}|{item['cover']}"
     dest = cache / (hashlib.sha1(key.encode()).hexdigest() + ".jpg")
     if dest.exists():
         return str(dest)

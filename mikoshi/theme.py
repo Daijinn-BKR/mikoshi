@@ -49,6 +49,13 @@ QPushButton:hover {{ background: {hover}; }}
 QPushButton:disabled {{ color: {muted}; }}
 QPushButton[primary="true"] {{ background: {accent}; color: {on_accent}; border-color: {accent}; font-weight: 600; }}
 QPushButton[primary="true"]:disabled {{ background: {surface}; color: {muted}; border-color: {border}; font-weight: 400; }}
+QPushButton[chip="true"] {{ border-radius: 14px; padding: 5px 14px; }}
+QPushButton[chip="true"]:checked {{ background: {text}; color: {bg}; border-color: {text}; }}
+QTabBar::tab {{ padding: 8px 18px; color: {muted}; border: none; border-bottom: 2px solid transparent; }}
+QTabBar::tab:selected {{ color: {text}; border-bottom: 2px solid {accent}; font-weight: 600; }}
+QTabBar::tab:hover:!selected {{ color: {text}; }}
+QTableView {{ alternate-background-color: {surface}; }}
+QTextBrowser {{ background: {panel}; border: none; }}
 QSlider::groove:horizontal {{ background: {surface}; height: 4px; border-radius: 2px; }}
 QSlider::sub-page:horizontal {{ background: {accent}; border-radius: 2px; }}
 QSlider::handle:horizontal {{ background: {accent}; width: 12px; margin: -5px 0; border-radius: 6px; }}

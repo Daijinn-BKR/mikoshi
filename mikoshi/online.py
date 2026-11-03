@@ -113,7 +113,7 @@ def _search_tmdb(query: str, key: str) -> list[Result]:
             continue
         name = row.get("title") or row.get("name") or ""
         year = _year(row.get("release_date") or row.get("first_air_date"))
-        fields = {"year": year, "description": row.get("overview")}
+        fields = {"year": year, "description": row.get("overview"), "category": media.replace("tv", "series")}
         # En una serie, el título del archivo es el del episodio: el nombre va en «Serie».
         fields["title" if media == "movie" else "series"] = name
         poster = row.get("poster_path")
@@ -195,6 +195,29 @@ def _search_rawg(query: str, key: str) -> list[Result]:
             cover_url=row.get("background_image") or "", source="RAWG", ref=(row.get("id"),),
         ))
     return results
+
+
+def steam_app_id(path: str) -> str | None:
+    """El número de juego de Steam de un acceso directo .url, si lo es."""
+    if not path.lower().endswith(".url"):
+        return None
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read(4096)
+    except OSError:
+        return None
+    match = re.search(r"steam://rungameid/(\d+)", text)
+    return match.group(1) if match else None
+
+
+def steam_cover(app_id: str) -> bytes:
+    """Portada vertical de la biblioteca de Steam. No necesita clave."""
+    if not app_id.isdigit():
+        raise OnlineError("Número de juego de Steam no válido.")
+    base = f"https://cdn.cloudflare.steamstatic.com/steam/apps/{app_id}"
+    try:
+        return download_cover(f"{base}/library_600x900.jpg")
+    except OnlineError:
+        return download_cover(f"{base}/header.jpg")
 
 
 def _rawg_details(result: Result, key: str) -> dict:

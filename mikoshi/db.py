@@ -60,12 +60,37 @@ CREATE TABLE IF NOT EXISTS collection_items (
     item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
     PRIMARY KEY (collection_id, item_id)
 );
+CREATE TABLE IF NOT EXISTS list_folders (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    parent_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS activity (
+    item_id INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+    play_count INTEGER NOT NULL DEFAULT 0,
+    last_played REAL NOT NULL DEFAULT 0,
+    position_ms INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    watched INTEGER NOT NULL DEFAULT 0
+);
 """
 
+# Visto al pasar de esta fracción: los créditos finales no obligan a llegar al último segundo.
+WATCHED_FRACTION = 0.9
+
 # Columnas añadidas después de la primera versión: las bases existentes las reciben al abrir.
-NEW_ITEM_COLUMNS = {
-    "checksum": "TEXT NOT NULL DEFAULT ''",
-    "checksum_mtime": "REAL NOT NULL DEFAULT 0",
+NEW_COLUMNS = {
+    "items": {
+        "checksum": "TEXT NOT NULL DEFAULT ''",
+        "checksum_mtime": "REAL NOT NULL DEFAULT 0",
+    },
+    "collections": {
+        "kind": "TEXT NOT NULL DEFAULT 'collection'",
+        "folder_id": "INTEGER",
+    },
+    "collection_items": {
+        "position": "INTEGER NOT NULL DEFAULT 0",
+    },
 }
 GROUP_FIELDS = {"series", "album"}
 
@@ -127,10 +152,11 @@ class Catalog:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.executescript(SCHEMA)
-        existing = {r["name"] for r in self.conn.execute("PRAGMA table_info(items)")}
-        for column, definition in NEW_ITEM_COLUMNS.items():
-            if column not in existing:
-                self.conn.execute(f"ALTER TABLE items ADD COLUMN {column} {definition}")
+        for table, columns in NEW_COLUMNS.items():
+            existing = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            for column, definition in columns.items():
+                if column not in existing:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
         self.conn.commit()
 
     def close(self) -> None:
@@ -166,6 +192,13 @@ class Catalog:
 
     def root(self, root_id: int) -> dict:
         return dict(self.conn.execute("SELECT * FROM roots WHERE id = ?", (root_id,)).fetchone())
+
+    def set_root_mode(self, root_id: int, mode: str) -> None:
+        self.conn.execute("UPDATE roots SET mode = ? WHERE id = ?", (mode, root_id))
+        self.conn.commit()
+
+    def favorite_root_ids(self) -> set[int]:
+        return {r["id"] for r in self.conn.execute("SELECT id FROM roots WHERE mode = 'favorites'")}
 
     def relocate_root(self, root_id: int, new_path: str) -> None:
         self.conn.execute("UPDATE roots SET path = ? WHERE id = ?", (os.path.abspath(new_path), root_id))
@@ -245,6 +278,44 @@ class Catalog:
         )
         return [r["name"] for r in rows]
 
+    # Actividad: reproducciones, posición para continuar y vistos
+
+    def activity(self) -> dict[int, dict]:
+        return {r["item_id"]: dict(r) for r in self.conn.execute("SELECT * FROM activity")}
+
+    def _ensure_activity(self, item_id: int) -> None:
+        self.conn.execute("INSERT OR IGNORE INTO activity (item_id) VALUES (?)", (item_id,))
+
+    def record_play(self, item_id: int) -> None:
+        self._ensure_activity(item_id)
+        self.conn.execute(
+            "UPDATE activity SET play_count = play_count + 1, last_played = ? WHERE item_id = ?",
+            (time.time(), item_id),
+        )
+        self.conn.commit()
+
+    def save_progress(self, item_id: int, position_ms: int, duration_ms: int) -> None:
+        """Guarda por dónde vas. Cerca del final cuenta como visto y vuelve a empezar."""
+        self._ensure_activity(item_id)
+        if duration_ms > 0 and position_ms >= duration_ms * WATCHED_FRACTION:
+            self.conn.execute(
+                "UPDATE activity SET watched = 1, position_ms = 0, duration_ms = ? WHERE item_id = ?",
+                (duration_ms, item_id),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE activity SET position_ms = ?, duration_ms = ? WHERE item_id = ?",
+                (max(position_ms, 0), duration_ms, item_id),
+            )
+        self.conn.commit()
+
+    def set_watched(self, item_id: int, watched: bool) -> None:
+        self._ensure_activity(item_id)
+        self.conn.execute(
+            "UPDATE activity SET watched = ?, position_ms = 0 WHERE item_id = ?", (int(watched), item_id)
+        )
+        self.conn.commit()
+
     def query_items(self, kind=None, tag=None, root_id=None, status=None, text=None,
                     collection=None, group=None) -> list[dict]:
         where, args = [], []
@@ -314,20 +385,102 @@ class Catalog:
     def collections(self) -> list[dict]:
         return [dict(r) for r in self.conn.execute("SELECT * FROM collections ORDER BY name COLLATE NOCASE")]
 
-    def create_collection(self, name: str) -> int:
-        self.conn.execute("INSERT OR IGNORE INTO collections (name) VALUES (?)", (name.strip(),))
+    def create_collection(self, name: str, kind: str = "collection", folder_id: int | None = None) -> int:
+        self.conn.execute(
+            "INSERT OR IGNORE INTO collections (name, kind, folder_id) VALUES (?, ?, ?)",
+            (name.strip(), kind, folder_id),
+        )
         self.conn.commit()
         return self.conn.execute("SELECT id FROM collections WHERE name = ?", (name.strip(),)).fetchone()["id"]
 
+    def collection(self, collection_id: int) -> dict:
+        return dict(self.conn.execute("SELECT * FROM collections WHERE id = ?", (collection_id,)).fetchone())
+
+    def list_name_exists(self, name: str, excluding: int | None = None) -> bool:
+        row = self.conn.execute("SELECT id FROM collections WHERE name = ?", (name.strip(),)).fetchone()
+        return bool(row) and row["id"] != excluding
+
+    def rename_collection(self, collection_id: int, name: str) -> None:
+        self.conn.execute("UPDATE collections SET name = ? WHERE id = ?", (name.strip(), collection_id))
+        self.conn.commit()
+
+    def move_collection(self, collection_id: int, folder_id: int | None) -> None:
+        self.conn.execute("UPDATE collections SET folder_id = ? WHERE id = ?", (folder_id, collection_id))
+        self.conn.commit()
+
     def delete_collection(self, collection_id: int) -> None:
-        """Borra la colección; sus elementos siguen en el catálogo."""
+        """Borra la lista; sus elementos siguen en el catálogo."""
         self.conn.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
         self.conn.commit()
 
     def add_to_collection(self, collection_id: int, item_ids) -> None:
+        last = self.conn.execute(
+            "SELECT coalesce(max(position), 0) AS last FROM collection_items WHERE collection_id = ?",
+            (collection_id,),
+        ).fetchone()["last"]
         self.conn.executemany(
-            "INSERT OR IGNORE INTO collection_items VALUES (?, ?)", [(collection_id, i) for i in item_ids]
+            "INSERT OR IGNORE INTO collection_items (collection_id, item_id, position) VALUES (?, ?, ?)",
+            [(collection_id, item_id, last + n) for n, item_id in enumerate(item_ids, 1)],
         )
+        self.conn.commit()
+
+    def list_order(self, collection_id: int) -> list[int]:
+        rows = self.conn.execute(
+            "SELECT item_id FROM collection_items WHERE collection_id = ? ORDER BY position, rowid", (collection_id,)
+        )
+        return [r["item_id"] for r in rows]
+
+    def move_in_list(self, collection_id: int, item_id: int, step: int) -> None:
+        order = self.list_order(collection_id)
+        index = order.index(item_id)
+        target = index + step
+        if not 0 <= target < len(order):
+            return
+        order[index], order[target] = order[target], order[index]
+        self.conn.executemany(
+            "UPDATE collection_items SET position = ? WHERE collection_id = ? AND item_id = ?",
+            [(position, collection_id, i) for position, i in enumerate(order)],
+        )
+        self.conn.commit()
+
+    # Carpetas de listas. Solo organizan la barra lateral: no existen en el disco.
+
+    def list_folders(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute("SELECT * FROM list_folders ORDER BY name COLLATE NOCASE")]
+
+    def create_folder(self, name: str, parent_id: int | None = None) -> int:
+        cur = self.conn.execute("INSERT INTO list_folders (name, parent_id) VALUES (?, ?)", (name.strip(), parent_id))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def rename_folder(self, folder_id: int, name: str) -> None:
+        self.conn.execute("UPDATE list_folders SET name = ? WHERE id = ?", (name.strip(), folder_id))
+        self.conn.commit()
+
+    def folder_descendants(self, folder_id: int) -> set[int]:
+        """La carpeta y todas las que contiene."""
+        children: dict[int | None, list[int]] = {}
+        for folder in self.list_folders():
+            children.setdefault(folder["parent_id"], []).append(folder["id"])
+        found, pending = set(), [folder_id]
+        while pending:
+            current = pending.pop()
+            found.add(current)
+            pending.extend(children.get(current, []))
+        return found
+
+    def move_folder(self, folder_id: int, parent_id: int | None) -> None:
+        if parent_id in self.folder_descendants(folder_id):
+            raise ValueError("Una carpeta no puede moverse dentro de sí misma.")
+        self.conn.execute("UPDATE list_folders SET parent_id = ? WHERE id = ?", (parent_id, folder_id))
+        self.conn.commit()
+
+    def delete_folder(self, folder_id: int) -> None:
+        """Borra solo la carpeta: lo que contiene sube un nivel y no se pierde."""
+        parent = self.conn.execute("SELECT parent_id FROM list_folders WHERE id = ?", (folder_id,)).fetchone()["parent_id"]
+        self.conn.execute("UPDATE list_folders SET parent_id = ? WHERE parent_id = ?", (parent, folder_id))
+        self.conn.execute("UPDATE collections SET folder_id = ? WHERE folder_id = ?", (parent, folder_id))
+        self.conn.execute("DELETE FROM list_folders WHERE id = ?", (folder_id,))
         self.conn.commit()
 
     def remove_from_collection(self, collection_id: int, item_ids) -> None:
@@ -366,6 +519,22 @@ class Catalog:
     def add_tag(self, item_ids, name: str) -> None:
         tag_id = self._tag_id(name.strip())
         self.conn.executemany("INSERT OR IGNORE INTO item_tags VALUES (?, ?)", [(i, tag_id) for i in item_ids])
+        self.conn.commit()
+
+    def rename_tag(self, old: str, new: str) -> None:
+        """Si la etiqueta nueva ya existe, las dos se fusionan."""
+        source = self.conn.execute("SELECT id FROM tags WHERE name = ?", (old,)).fetchone()["id"]
+        target = self.conn.execute("SELECT id FROM tags WHERE name = ?", (new.strip(),)).fetchone()
+        if target and target["id"] != source:
+            self.conn.execute("UPDATE OR IGNORE item_tags SET tag_id = ? WHERE tag_id = ?", (target["id"], source))
+            self.conn.execute("DELETE FROM tags WHERE id = ?", (source,))
+        else:
+            self.conn.execute("UPDATE tags SET name = ? WHERE id = ?", (new.strip(), source))
+        self.conn.commit()
+
+    def delete_tag(self, name: str) -> None:
+        """Quita la etiqueta de todos los elementos; los elementos siguen en el catálogo."""
+        self.conn.execute("DELETE FROM tags WHERE name = ?", (name,))
         self.conn.commit()
 
     def all_tags(self) -> list[str]:

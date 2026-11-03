@@ -81,6 +81,77 @@ def test_collections(catalog, lib):
     assert len(catalog.query_items()) == 2
 
 
+def test_old_lists_are_upgraded_keeping_items(tmp_path):
+    path = tmp_path / "v02.db"
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE collections (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE);
+        CREATE TABLE collection_items (collection_id INTEGER NOT NULL, item_id INTEGER NOT NULL,
+            PRIMARY KEY (collection_id, item_id));
+        INSERT INTO collections VALUES (1, 'Favoritos');
+        INSERT INTO collection_items VALUES (1, 7);
+    """)
+    conn.commit()
+    conn.close()
+    cat = Catalog(path)
+    info = cat.collection(1)
+    assert (info["kind"], info["folder_id"]) == ("collection", None)
+    assert cat.list_order(1) == [7]
+    cat.close()
+
+
+def test_playlist_keeps_order_and_moves(catalog, lib):
+    for name in "abc":
+        (lib / f"{name}.gba").write_bytes(name.encode())
+    scan(catalog, lib)
+    ids = {i["rel_path"][0]: i["id"] for i in catalog.query_items()}
+    pid = catalog.create_collection("Mix", "playlist")
+    catalog.add_to_collection(pid, [ids["c"], ids["a"]])
+    catalog.add_to_collection(pid, [ids["b"], ids["a"]])
+    assert catalog.list_order(pid) == [ids["c"], ids["a"], ids["b"]]
+    catalog.move_in_list(pid, ids["b"], -1)
+    assert catalog.list_order(pid) == [ids["c"], ids["b"], ids["a"]]
+    catalog.move_in_list(pid, ids["c"], -1)
+    assert catalog.list_order(pid)[0] == ids["c"]
+
+
+def test_deleting_folder_keeps_contents_one_level_up(catalog):
+    top = catalog.create_folder("Música")
+    inner = catalog.create_folder("Rock", top)
+    deep = catalog.create_folder("80s", inner)
+    pid = catalog.create_collection("Mix", "playlist", inner)
+    catalog.delete_folder(inner)
+    assert catalog.collection(pid)["folder_id"] == top
+    assert next(f for f in catalog.list_folders() if f["id"] == deep)["parent_id"] == top
+
+
+def test_folder_cannot_move_inside_itself(catalog):
+    top = catalog.create_folder("A")
+    inner = catalog.create_folder("B", top)
+    with pytest.raises(ValueError):
+        catalog.move_folder(top, inner)
+    with pytest.raises(ValueError):
+        catalog.move_folder(top, top)
+    catalog.move_folder(inner, None)
+    assert next(f for f in catalog.list_folders() if f["id"] == inner)["parent_id"] is None
+
+
+def test_rename_tag_merges_and_delete_keeps_items(catalog, lib):
+    (lib / "a.gba").write_bytes(b"1")
+    (lib / "b.gba").write_bytes(b"2")
+    scan(catalog, lib)
+    a, b = catalog.query_items()
+    catalog.add_tag([a["id"], b["id"]], "rpg")
+    catalog.add_tag([a["id"]], "RPG clásico")
+    catalog.rename_tag("RPG clásico", "rpg")
+    assert catalog.all_tags() == ["rpg"]
+    assert len(catalog.query_items(tag="rpg")) == 2
+    catalog.rename_tag("rpg", "Rol")
+    assert catalog.all_tags() == ["Rol"]
+    catalog.delete_tag("Rol")
+    assert catalog.all_tags() == [] and len(catalog.query_items()) == 2
+
+
 def test_group_names_respect_edits(catalog, lib):
     (lib / "Dark.S01E02.gba").write_bytes(b"1")
     (lib / "c.gba").write_bytes(b"2")

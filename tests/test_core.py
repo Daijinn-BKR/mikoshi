@@ -202,6 +202,41 @@ def test_failed_write_leaves_original(lib):
     assert [p.name for p in lib.iterdir()] == ["roto.mp3"]
 
 
+def test_write_waits_for_brief_lock_then_succeeds(lib, monkeypatch):
+    path = lib / "f.jpg"
+    Image.new("RGB", (8, 8)).save(path)
+    real_replace = os.replace
+    calls = []
+
+    def locked_twice(src, dst):
+        calls.append(dst)
+        if len(calls) <= 2:
+            raise PermissionError("en uso")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(metadata.os, "replace", locked_twice)
+    monkeypatch.setattr(metadata, "REPLACE_WAIT", 0)
+    metadata.write_file(str(path), "image", {"artist": "Ana"})
+    assert len(calls) == 3
+    assert metadata.read_file(str(path), "image")[0]["artist"] == "Ana"
+
+
+def test_permanent_lock_reports_error_and_keeps_original(lib, monkeypatch):
+    path = lib / "f.jpg"
+    Image.new("RGB", (8, 8)).save(path)
+    before = path.read_bytes()
+
+    def locked(src, dst):
+        raise PermissionError("en uso")
+
+    monkeypatch.setattr(metadata.os, "replace", locked)
+    monkeypatch.setattr(metadata, "REPLACE_WAIT", 0)
+    with pytest.raises(metadata.MetadataError):
+        metadata.write_file(str(path), "image", {"artist": "Ana"})
+    assert path.read_bytes() == before
+    assert [p.name for p in lib.iterdir()] == ["f.jpg"]
+
+
 def test_unwritable_format_rejected(lib):
     path = lib / "a.pdf"
     path.write_bytes(b"x")

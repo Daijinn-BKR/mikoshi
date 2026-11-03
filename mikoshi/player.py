@@ -1,14 +1,16 @@
-"""Reproductor integrado de vídeo, música y fotos."""
+"""Reproductor de vídeo, música y fotos: incrustable en una página o en su propia ventana."""
 from __future__ import annotations
 
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QImageReader, QKeySequence, QPixmap, QShortcut
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
-from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QSlider, QStackedWidget, QVBoxLayout
+from PySide6.QtWidgets import (
+    QDialog, QHBoxLayout, QLabel, QPushButton, QSlider, QStackedWidget, QVBoxLayout, QWidget,
+)
 
 from .db import display_title, full_path
 
@@ -22,14 +24,37 @@ def format_time(ms: int) -> str:
     return f"{total // 60}:{total % 60:02d}"
 
 
-class PlayerDialog(QDialog):
-    def __init__(self, items: list[dict], index: int, open_external, parent=None):
+class PlayerHooks:
+    """Lo que el reproductor cuenta al catálogo. Sin catálogo, no hace nada."""
+
+    def __init__(self, catalog=None, resume: bool = False):
+        self.catalog, self.resume = catalog, resume
+
+    def start_position(self, item: dict) -> int:
+        if not (self.catalog and self.resume):
+            return 0
+        return self.catalog.activity().get(item["id"], {}).get("position_ms", 0)
+
+    def played(self, item: dict) -> None:
+        if self.catalog:
+            self.catalog.record_play(item["id"])
+
+    def progress(self, item: dict, position: int, duration: int) -> None:
+        if self.catalog and item["kind"] == "video" and duration > 0:
+            self.catalog.save_progress(item["id"], position, duration)
+
+
+class PlayerWidget(QWidget):
+    item_changed = Signal(dict)
+
+    def __init__(self, items: list[dict], index: int, open_external, hooks: PlayerHooks | None = None, parent=None):
         super().__init__(parent)
         self.items, self.index, self.open_external = items, index, open_external
+        self.hooks = hooks or PlayerHooks()
         self.seeking = False
+        self.pending_seek = 0
         self.original: QPixmap | None = None
-        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint)
-        self.resize(960, 640)
+        self.loaded_item: dict | None = None
 
         self.video = QVideoWidget()
         self.picture = QLabel(alignment=Qt.AlignmentFlag.AlignCenter)
@@ -68,6 +93,7 @@ class PlayerDialog(QDialog):
         controls.addWidget(self.external_button)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.stage, 1)
         layout.addLayout(controls)
 
@@ -84,19 +110,27 @@ class PlayerDialog(QDialog):
         self.player.errorOccurred.connect(self._error)
         self.player.mediaStatusChanged.connect(self._status_changed)
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, self.toggle)
-        QShortcut(QKeySequence(Qt.Key.Key_Right), self, lambda: self.go(1))
-        QShortcut(QKeySequence(Qt.Key.Key_Left), self, lambda: self.go(-1))
-        self.load()
+        if items:
+            self.load()
 
     @property
     def item(self) -> dict:
         return self.items[self.index]
 
+    def set_queue(self, items: list[dict], index: int) -> None:
+        self.items, self.index = items, index
+        self.load()
+
+    def save_progress(self) -> None:
+        if self.loaded_item and self.player.duration() > 0:
+            self.hooks.progress(self.loaded_item, self.player.position(), self.player.duration())
+
     def load(self) -> None:
+        self.save_progress()
         self.player.stop()
         self.player.setSource(QUrl())
+        self.loaded_item = None
         path = full_path(self.item)
-        self.setWindowTitle(f"{display_title(self.item)} · Mikoshi")
         self.previous_button.setEnabled(self.index > 0)
         self.next_button.setEnabled(self.index < len(self.items) - 1)
         kind = self.item["kind"]
@@ -105,8 +139,13 @@ class PlayerDialog(QDialog):
             widget.setVisible(is_media)
         self.position.setValue(0)
         if not os.path.exists(path):
+            self.item_changed.emit(self.item)
             self._show_message(f"No se encuentra el archivo.\n¿Está encendido el servidor?\n\n{path}")
-        elif kind == "image":
+            return
+        # Primero se cuenta la reproducción, para que la página muestre el número ya actualizado.
+        self.hooks.played(self.item)
+        self.item_changed.emit(self.item)
+        if kind == "image":
             self._load_image(path)
         elif is_media:
             if kind == "video":
@@ -114,6 +153,8 @@ class PlayerDialog(QDialog):
             else:
                 self.original = None
                 self._show_message(f"♪\n{display_title(self.item)}")
+            self.loaded_item = self.item
+            self.pending_seek = self.hooks.start_position(self.item)
             self.player.setSource(QUrl.fromLocalFile(path))
             self.player.play()
 
@@ -150,7 +191,7 @@ class PlayerDialog(QDialog):
     def toggle(self) -> None:
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
-        elif self.item["kind"] != "image":
+        elif self.items and self.item["kind"] != "image":
             self.player.play()
 
     def _seek(self) -> None:
@@ -167,11 +208,19 @@ class PlayerDialog(QDialog):
         self.play_button.setText("Pausa" if playing else "Reproducir")
 
     def _status_changed(self, status) -> None:
-        # Al acabar una pista, sigue la siguiente de la lista.
-        if status == QMediaPlayer.MediaStatus.EndOfMedia and self.index < len(self.items) - 1:
-            self.go(1)
+        if status in (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia) and self.pending_seek:
+            # Continúa donde se dejó.
+            self.player.setPosition(self.pending_seek)
+            self.pending_seek = 0
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            if self.loaded_item:
+                self.hooks.progress(self.loaded_item, self.player.duration(), self.player.duration())
+                self.loaded_item = None
+            if self.index < len(self.items) - 1:
+                self.go(1)
 
     def _error(self, _error, text: str) -> None:
+        self.loaded_item = None
         self._show_message(f"Este archivo no se puede reproducir aquí.\nUsa «Abrir fuera…».\n\n{text}")
 
     def _open_outside(self) -> None:
@@ -182,7 +231,29 @@ class PlayerDialog(QDialog):
         except OSError as exc:
             self._show_message(f"No se pudo abrir:\n{exc}")
 
-    def done(self, result) -> None:
+    def stop(self) -> None:
+        self.save_progress()
+        self.loaded_item = None
         self.player.stop()
         self.player.setSource(QUrl())
+
+
+class PlayerDialog(QDialog):
+    def __init__(self, items: list[dict], index: int, open_external, parent=None, hooks: PlayerHooks | None = None):
+        super().__init__(parent)
+        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint)
+        self.resize(960, 640)
+        self.view = PlayerWidget(items, index, open_external, hooks, self)
+        self.view.item_changed.connect(lambda item: self.setWindowTitle(f"{display_title(item)} · Mikoshi"))
+        self.setWindowTitle(f"{display_title(self.view.item)} · Mikoshi")
+        QVBoxLayout(self).addWidget(self.view)
+        QShortcut(QKeySequence(Qt.Key.Key_Right), self, lambda: self.view.go(1))
+        QShortcut(QKeySequence(Qt.Key.Key_Left), self, lambda: self.view.go(-1))
+
+    def __getattr__(self, name):
+        # Acceso directo a las piezas del reproductor: dialog.player, dialog.go(), etc.
+        return getattr(self.__dict__.get("view") or super().__getattribute__("view"), name)
+
+    def done(self, result) -> None:
+        self.view.stop()
         super().done(result)

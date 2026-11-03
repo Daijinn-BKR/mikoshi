@@ -4,37 +4,29 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
-import subprocess
 import sys
 import time
-from collections import OrderedDict
 from pathlib import Path
 
-from PySide6.QtCore import (
-    QAbstractTableModel, QModelIndex, QObject, QRect, QRunnable, QSize, Qt, QThread, QThreadPool, Signal,
-)
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QRect, QSize, Qt, QThread, Signal
 from PySide6.QtGui import (
-    QAction, QBrush, QColor, QFont, QIcon, QImage, QIntValidator, QKeySequence, QLinearGradient, QPainter, QPixmap,
+    QAction, QColor, QIcon, QImage, QIntValidator, QKeySequence, QPainter, QPixmap,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
     QHeaderView, QInputDialog, QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QMainWindow, QMenu,
     QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSlider, QSplitter, QStackedWidget, QStyle,
-    QStyledItemDelegate, QTableView, QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QStyledItemDelegate, QTableView, QTabWidget, QToolBar, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from . import dialogs, maintenance, metadata, online, scanner, thumbnails
-from .db import Catalog, covers_dir, display_title, effective, full_path
-from .player import PLAYABLE, PlayerDialog
+from .db import Catalog, display_title, effective, full_path
+from .nowplaying import NowPlayingBar
+from .player import PLAYABLE, PlayerDialog, PlayerHooks
+from .sections import BooksSection, CinemaSection, FavoritesSection, GamesSection, MusicSection
 from .theme import apply_theme
+from .widgets import Thumbs, creator, human_size, number, open_path, reveal_path, stars, year
 
-KIND_STYLE = {
-    "video": ("#3f6fb5", "VÍDEO"),
-    "audio": ("#8a4fb0", "AUDIO"),
-    "image": ("#3a9276", "IMAGEN"),
-    "document": ("#b5793f", "LIBRO"),
-    "game": ("#b54f5c", "JUEGO"),
-}
 BACKUP_INTERVAL = 24 * 3600
 SORT_OPTIONS = [
     ("Título", 0, Qt.SortOrder.AscendingOrder), ("Creador", 2, Qt.SortOrder.AscendingOrder),
@@ -42,58 +34,6 @@ SORT_OPTIONS = [
     ("Tamaño", 6, Qt.SortOrder.DescendingOrder), ("Tipo", 1, Qt.SortOrder.AscendingOrder),
 ]
 COLUMNS = ["Título", "Tipo", "Creador", "Año", "Valoración", "Etiquetas", "Tamaño", "Ruta"]
-
-
-def human_size(size: int) -> str:
-    value = float(size)
-    for unit in ("B", "KB", "MB", "GB"):
-        if value < 1024:
-            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
-        value /= 1024
-    return f"{value:.1f} TB"
-
-
-def creator(item: dict) -> str:
-    meta = effective(item)
-    return next((meta[k] for k in metadata.CREATOR_KEYS if meta.get(k)), "")
-
-
-def year(item: dict) -> str:
-    meta = effective(item)
-    return meta.get("year") or meta.get("date", "")[:4]
-
-
-def stars(rating: int) -> str:
-    return "★" * rating + "☆" * (5 - rating)
-
-
-def placeholder(kind: str) -> QPixmap:
-    color, label = KIND_STYLE[kind]
-    pixmap = QPixmap(240, 240)
-    gradient = QLinearGradient(0, 0, 240, 240)
-    gradient.setColorAt(0, QColor(color))
-    gradient.setColorAt(1, QColor(color).darker(170))
-    painter = QPainter(pixmap)
-    painter.fillRect(pixmap.rect(), QBrush(gradient))
-    painter.setPen(QColor("white"))
-    painter.setFont(QFont("Segoe UI", 20, QFont.Weight.DemiBold))
-    painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, label)
-    painter.end()
-    return pixmap
-
-
-def open_path(path: str) -> None:
-    if sys.platform == "win32":
-        os.startfile(path)
-    else:
-        subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", path])
-
-
-def reveal_path(path: str) -> None:
-    if sys.platform == "win32":
-        subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
-    else:
-        open_path(os.path.dirname(path))
 
 
 # Trabajos en segundo plano. Cada hilo abre su propia conexión a SQLite.
@@ -125,7 +65,7 @@ class ScanWorker(QThread):
 
 class WriteWorker(QThread):
     progress = Signal(str)
-    done = Signal(int, list)
+    done = Signal(int, list, list)
 
     def __init__(self, db_path: str, item_ids: list[int], parent=None):
         super().__init__(parent)
@@ -133,24 +73,29 @@ class WriteWorker(QThread):
 
     def run(self) -> None:
         catalog = Catalog(self.db_path)
-        written, errors = 0, []
+        written, errors, verified = 0, [], []
         for index, item_id in enumerate(self.item_ids, 1):
             if self.isInterruptionRequested():
                 break
             item = catalog.get_item(item_id)
             name = Path(item["rel_path"]).name
+            labels = dict(metadata.FIELDS[item["kind"]])
             self.progress.emit(f"Escribiendo {index}/{len(self.item_ids)} · {name}")
             try:
-                rejected = scanner.apply_edits_to_file(catalog, item)
+                # Lo confirmado se ha vuelto a leer del archivo después de escribirlo.
+                confirmed, rejected = scanner.write_and_verify(catalog, item)
                 written += 1
+                if confirmed:
+                    fresh = catalog.get_item(item_id)["file_meta"]
+                    verified.append(f"{name}: " + ", ".join(
+                        f"{labels[k]} = «{fresh.get(k, '') or 'vacío'}» ✓" for k in confirmed))
                 if rejected:
-                    labels = dict(metadata.FIELDS[item["kind"]])
                     errors.append(f"{name}: el formato no conservó {', '.join(labels[k] for k in rejected)}. "
                                   "Revisa el valor (temporada y episodio deben ser números).")
             except (metadata.MetadataError, OSError) as exc:
                 errors.append(f"{name}: {exc}")
         catalog.close()
-        self.done.emit(written, errors)
+        self.done.emit(written, errors, verified)
 
 
 class MaintenanceWorker(QThread):
@@ -168,37 +113,18 @@ class MaintenanceWorker(QThread):
         self.done.emit(result)
 
 
-class ThumbSignals(QObject):
-    ready = Signal(int, str, QImage)
-
-
-class ThumbJob(QRunnable):
-    def __init__(self, item: dict, key: str, signals: ThumbSignals):
-        super().__init__()
-        self.item, self.key, self.signals = item, key, signals
-
-    def run(self) -> None:
-        path = thumbnails.thumbnail_for(self.item)
-        self.signals.ready.emit(self.item["id"], self.key, QImage(path) if path else QImage())
-
-
 # Modelo de datos, compartido por la cuadrícula y la lista
 
 class ItemsModel(QAbstractTableModel):
-    MAX_CACHED = 3000
-
-    def __init__(self, parent=None):
+    def __init__(self, thumbs: Thumbs, parent=None):
         super().__init__(parent)
         self.items: list[dict] = []
         self.sort_column, self.sort_order = 0, Qt.SortOrder.AscendingOrder
         self.natural: str | None = None
-        self.placeholders = {kind: placeholder(kind) for kind in KIND_STYLE}
-        self.pixmaps: OrderedDict[str, QPixmap] = OrderedDict()
-        self.requested: set[str] = set()
-        self.pool = QThreadPool(self)
-        self.pool.setMaxThreadCount(4)
-        self.signals = ThumbSignals()
-        self.signals.ready.connect(self._thumb_ready)
+        self.thumbs = thumbs
+        # Atajos a la caché compartida de miniaturas.
+        self.pixmaps, self.pool, self.signals = thumbs.pixmaps, thumbs.pool, thumbs.signals
+        thumbs.updated.connect(self._thumb_ready)
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self.items)
@@ -237,39 +163,21 @@ class ItemsModel(QAbstractTableModel):
             return full_path(item) + note
         return None
 
-    @staticmethod
-    def _key(item: dict) -> str:
-        return f"{item['id']}|{item['mtime']}|{item['cover']}"
-
     def _thumbnail(self, item: dict) -> QPixmap:
-        key = self._key(item)
-        cached = self.pixmaps.get(key)
-        if cached is not None:
-            self.pixmaps.move_to_end(key)
-            return cached
-        if key not in self.requested and item["status"] == "ok":
-            self.requested.add(key)
-            self.pool.start(ThumbJob(item, key, self.signals))
-        return self.placeholders[item["kind"]]
+        return self.thumbs.get(item)
 
-    def _thumb_ready(self, item_id: int, key: str, image: QImage) -> None:
-        if image.isNull():
-            return
-        self.pixmaps[key] = QPixmap.fromImage(image)
-        while len(self.pixmaps) > self.MAX_CACHED:
-            self.pixmaps.popitem(last=False)
+    def _thumb_ready(self, item_id: int) -> None:
         for row, item in enumerate(self.items):
             if item["id"] == item_id:
                 index = self.index(row, 0)
                 self.dataChanged.emit(index, index, [Qt.ItemDataRole.DecorationRole])
                 break
 
-    @staticmethod
-    def _number(value) -> int:
-        match = re.match(r"\d+", str(value or ""))
-        return int(match.group(0)) if match else 10 ** 6
+    _number = staticmethod(number)
 
     def _sorted(self, items: list[dict]) -> list[dict]:
+        if self.natural == "list":
+            return list(items)
         if self.natural:
             # Dentro de una serie o un álbum manda el orden de episodios o pistas.
             def order(item):
@@ -291,8 +199,7 @@ class ItemsModel(QAbstractTableModel):
         return sorted(items, key=key, reverse=self.sort_order == Qt.SortOrder.DescendingOrder)
 
     def set_items(self, items: list[dict]) -> None:
-        self.pool.clear()
-        self.requested -= {k for k in self.requested if k not in self.pixmaps}
+        self.thumbs.forget_pending()
         self.beginResetModel()
         self.items = self._sorted(items)
         self.endResetModel()
@@ -434,6 +341,9 @@ class DetailPanel(QScrollArea):
         buttons.addWidget(self.save_button)
         buttons.addWidget(self.write_button)
         layout.addLayout(buttons)
+        self.verify_button = QPushButton("Comprobar qué hay en el archivo")
+        self.verify_button.clicked.connect(self._verify_file)
+        layout.addWidget(self.verify_button)
         self.save_button.clicked.connect(self.commit)
         self.write_button.clicked.connect(self.write_requested)
 
@@ -457,7 +367,10 @@ class DetailPanel(QScrollArea):
     def _form_edits(self) -> dict:
         edits = {k: v for k, v in self.item["edits"].items() if k not in self.inputs}
         for key, widget in self.inputs.items():
-            value = widget.toPlainText() if isinstance(widget, QPlainTextEdit) else widget.text()
+            if isinstance(widget, QComboBox):
+                value = widget.currentData()
+            else:
+                value = widget.toPlainText() if isinstance(widget, QPlainTextEdit) else widget.text()
             value = value.strip()
             if value != self.item["file_meta"].get(key, ""):
                 edits[key] = value
@@ -488,13 +401,8 @@ class DetailPanel(QScrollArea):
             QMessageBox.warning(self, "No se pudo copiar", str(exc))
 
     def _store_cover(self, data: bytes, suffix: str) -> None:
-        # Un nombre nuevo cada vez hace que la miniatura se regenere sola.
-        dest = covers_dir() / f"{self.item['id']}-{time.time_ns()}{suffix}"
-        dest.write_bytes(data)
-        if self.item["cover"]:
-            (covers_dir() / Path(self.item["cover"]).name).unlink(missing_ok=True)
         self.commit()
-        self.catalog.save_user_data(self.item["id"], cover=str(dest))
+        thumbnails.save_cover(self.catalog, self.item, data, suffix)
         self.saved.emit(self.item["id"])
         self.show_item(self.catalog.get_item(self.item["id"]))
 
@@ -522,6 +430,8 @@ class DetailPanel(QScrollArea):
             widget = self.inputs.get(key)
             if isinstance(widget, QPlainTextEdit):
                 widget.setPlainText(value)
+            elif isinstance(widget, QComboBox):
+                widget.setCurrentIndex(max(widget.findData(value), 0))
             elif widget is not None:
                 widget.setText(value)
         self.dirty = True
@@ -547,7 +457,7 @@ class DetailPanel(QScrollArea):
         self.inputs = {}
         enabled = item is not None
         for widget in (self.open_button, self.reveal_button, self.cover_button, self.rating,
-                       self.tags, self.notes, self.save_button):
+                       self.tags, self.notes, self.save_button, self.verify_button):
             widget.setEnabled(enabled)
         self.play_button.setEnabled(bool(item) and item["kind"] in PLAYABLE)
         self.online_button.setEnabled(bool(item) and item["kind"] in online.SOURCES)
@@ -579,6 +489,12 @@ class DetailPanel(QScrollArea):
                 widget = QPlainTextEdit(meta.get(key, ""))
                 widget.setFixedHeight(80)
                 widget.textChanged.connect(self._mark_dirty)
+            elif key in metadata.CHOICES:
+                widget = QComboBox()
+                for value, text in metadata.CHOICES[key]:
+                    widget.addItem(text, value)
+                widget.setCurrentIndex(max(widget.findData(meta.get(key, "")), 0))
+                widget.currentIndexChanged.connect(self._mark_dirty)
             else:
                 widget = QLineEdit(meta.get(key, ""))
                 widget.textEdited.connect(self._mark_dirty)
@@ -591,6 +507,27 @@ class DetailPanel(QScrollArea):
             [f"Tamaño: {human_size(item['size'])}"] + [f"{k}: {v}" for k, v in item["technical"].items()]))
         self._refresh_write_state()
         self._loading = False
+
+    def _verify_file(self) -> None:
+        """Lee el archivo en este momento y lo compara con lo que muestra el catálogo."""
+        if not self.item:
+            return
+        self.commit()
+        path = full_path(self.item)
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "No disponible", f"No se encuentra:\n{path}")
+            return
+        rows = metadata.verify_in_file(self.item, path)
+        if not rows:
+            QMessageBox.information(self, "Comprobar archivo",
+                                    "Este formato no guarda metadatos en el archivo: todo vive en el catálogo.")
+            return
+        lines = [f"{'✓' if ok else '✗'} {label}: archivo «{in_file or 'vacío'}»"
+                 + ("" if ok else f" · catálogo «{shown or 'vacío'}»") for label, shown, in_file, ok in rows]
+        pending = sum(1 for row in rows if not row[3])
+        summary = ("Todo lo que ves está escrito en el archivo." if not pending else
+                   f"{pending} campo(s) solo están en el catálogo. Usa «Escribir en archivo» para guardarlos.")
+        QMessageBox.information(self, "Comprobar archivo", summary + "\n\n" + "\n".join(lines))
 
     def _refresh_write_state(self) -> None:
         path = full_path(self.item)
@@ -694,8 +631,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Mikoshi")
         self.resize(1320, 820)
 
-        self.model = ItemsModel(self)
+        self.thumbs = Thumbs(self)
+        self.model = ItemsModel(self.thumbs, self)
         self.model.signals.ready.connect(self._thumb_arrived)
+        self.now_playing = NowPlayingBar(self.catalog, self.thumbs)
 
         self.sidebar = QTreeWidget(headerHidden=True)
         self.sidebar.setMinimumWidth(190)
@@ -762,12 +701,88 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.detail)
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([210, 750, 360])
-        self.setCentralWidget(splitter)
+
+        self.sections = [CinemaSection(self), MusicSection(self), FavoritesSection(self), BooksSection(self),
+                         GamesSection(self)]
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        for section in self.sections:
+            self.tabs.addTab(section, section.title)
+        self.tabs.addTab(splitter, "Todo")
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(self.tabs, 1)
+        central_layout.addWidget(self.now_playing)
+        self.setCentralWidget(central)
 
         self._build_actions()
         self._refresh_sidebar()
         self.reload()
+        self.previous_tab = None
+        self.tabs.currentChanged.connect(self._tab_changed)
+        saved = self.catalog.setting("tab", "Todo")
+        titles = [self.tabs.tabText(i) for i in range(self.tabs.count())]
+        self.tabs.setCurrentIndex(titles.index(saved) if saved in titles else self.tabs.count() - 1)
+        self._tab_changed(self.tabs.currentIndex())
         self._report_backup_error()
+
+    # Secciones
+
+    def _tab_changed(self, index: int) -> None:
+        if self.previous_tab is not None:
+            self.previous_tab.leave()
+        widget = self.tabs.widget(index)
+        self.previous_tab = widget if widget in self.sections else None
+        if widget in self.sections:
+            self.detail.commit()
+            widget.refresh()
+        else:
+            self.reload()
+
+    def data_changed(self) -> None:
+        """Algo cambió en el catálogo: refresca la sección que se está viendo."""
+        current = self.tabs.currentWidget() if hasattr(self, "tabs") else None
+        if current in getattr(self, "sections", []):
+            current.refresh()
+
+    def status(self, text: str) -> None:
+        self.status_label.setText(text)
+
+    def play_items(self, items: list[dict], index: int, resume: bool = False) -> None:
+        """La música va a la barra fija; vídeo y fotos se abren en su ventana."""
+        item = items[index]
+        if item["kind"] == "audio":
+            audio = [i for i in items if i["kind"] == "audio"]
+            self.now_playing.play(audio, audio.index(item))
+            return
+        self.now_playing.pause()
+        PlayerDialog(items, index, open_path, self, hooks=PlayerHooks(self.catalog, resume)).exec()
+
+    def edit_item(self, item_id: int) -> None:
+        item = self.catalog.get_item(item_id)
+        if not item:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Editar · {display_title(item)}")
+        dialog.resize(460, 760)
+        panel = DetailPanel(self.catalog, dialog)
+        panel.show_item(item)
+        panel.set_thumbnail(self.thumbs.get(item))
+        panel.saved.connect(self._item_saved)
+        panel.saved.connect(lambda _id: panel.set_thumbnail(self.thumbs.get(panel.item)))
+        panel.write_requested.connect(lambda: self._write_files([item_id]))
+        panel.play_requested.connect(lambda: self.play_items([panel.item], 0))
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(panel, 1)
+        close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close.rejected.connect(dialog.reject)
+        layout.addWidget(close)
+        dialog.finished.connect(lambda _r: panel.commit())
+        self.editor = panel
+        dialog.exec()
+        self.editor = None
 
     # Menús y barra
 
@@ -904,9 +919,10 @@ class MainWindow(QMainWindow):
         self.sidebar.blockSignals(True)
         self.sidebar.clear()
 
-        def section(title, expanded=True):
+        def section(title, expanded=True, key=None):
             node = QTreeWidgetItem(self.sidebar, [title])
             node.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            node.setData(0, Qt.ItemDataRole.UserRole, ("section", key))
             font = node.font(0)
             font.setBold(True)
             node.setFont(0, font)
@@ -921,22 +937,36 @@ class MainWindow(QMainWindow):
                 parent.setExpanded(True)
             return node
 
-        library = section("Biblioteca")
+        library = section("Biblioteca", key="library")
         entry(library, "Todo", ("all", None))
         for kind, label in metadata.KIND_LABELS.items():
             entry(library, label, ("kind", kind))
         state = section("Estado")
         entry(state, "Sin escribir en archivo", ("pending", None))
         entry(state, "Faltantes", ("missing", None))
-        collections = self.catalog.collections()
-        if collections:
-            collection_node = section("Colecciones")
-            for collection in collections:
-                entry(collection_node, collection["name"], ("collection", collection["id"]))
+        lists_node = section("Mis listas", key="lists")
+        folders = self.catalog.list_folders()
+        lists = self.catalog.collections()
+
+        def fill(parent, folder_id):
+            for folder in folders:
+                if folder["parent_id"] == folder_id:
+                    node = QTreeWidgetItem(parent, [f"📁 {folder['name']}"])
+                    node.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                    node.setData(0, Qt.ItemDataRole.UserRole, ("list_folder", folder["id"]))
+                    fill(node, folder["id"])
+                    node.setExpanded(True)
+            for item in lists:
+                if item["folder_id"] == folder_id:
+                    mark = "♫" if item["kind"] == "playlist" else "▦"
+                    entry(parent, f"{mark} {item['name']}", ("collection", item["id"]))
+
+        fill(lists_node, None)
+        lists_node.setExpanded(True)
         for title, field in (("Series", "series"), ("Álbumes", "album")):
             names = self.catalog.group_names(field)
             if names:
-                group_node = section(title, expanded=False)
+                group_node = section(title, expanded=False, key=field)
                 for name in names:
                     entry(group_node, name, (field, name))
         tags = self.catalog.all_tags()
@@ -944,12 +974,11 @@ class MainWindow(QMainWindow):
             tag_node = section("Etiquetas")
             for tag in tags:
                 entry(tag_node, tag, ("tag", tag))
-        roots = self.catalog.roots()
-        if roots:
-            root_node = section("Carpetas")
-            for root in roots:
-                node = entry(root_node, Path(root["path"]).name or root["path"], ("root", root["id"]))
-                node.setToolTip(0, root["path"])
+        root_node = section("Carpetas en disco", key="roots")
+        for root in self.catalog.roots():
+            node = entry(root_node, Path(root["path"]).name or root["path"], ("root", root["id"]))
+            node.setToolTip(0, root["path"])
+        root_node.setExpanded(True)
         if not self.sidebar.selectedItems():
             self.sidebar.topLevelItem(0).child(0).setSelected(True)
         self.sidebar.blockSignals(False)
@@ -966,8 +995,12 @@ class MainWindow(QMainWindow):
         text = self.search.text() if hasattr(self, "search") else ""
         args = {"text": text}
         self.model.natural = None
+        order = None
         if kind == "collection":
             args["collection"] = value
+            if self.catalog.collection(value)["kind"] == "playlist":
+                order = self.catalog.list_order(value)
+                self.model.natural = "list"
         elif kind in ("series", "album"):
             args["group"] = (kind, value)
             self.model.natural = kind
@@ -982,6 +1015,9 @@ class MainWindow(QMainWindow):
         items = self.catalog.query_items(**args)
         if kind == "pending":
             items = [i for i in items if metadata.pending_edits(i, full_path(i))]
+        if order is not None:
+            place = {item_id: n for n, item_id in enumerate(order)}
+            items.sort(key=lambda i: place[i["id"]])
         self.model.set_items(self._apply_filters(items))
         self.detail.show_item(None)
         self._show_view()
@@ -1036,12 +1072,15 @@ class MainWindow(QMainWindow):
         if not item:
             return
         self.detail.commit()
-        # La lista de reproducción es lo que se está viendo, del mismo tipo.
-        queue = [i for i in self.model.items if i["kind"] == item["kind"]]
+        # La cola es lo que se está viendo: del mismo tipo o, en una playlist, todo lo reproducible.
+        if self.model.natural == "list":
+            queue = [i for i in self.model.items if i["kind"] in PLAYABLE]
+        else:
+            queue = [i for i in self.model.items if i["kind"] == item["kind"]]
         index = next((n for n, i in enumerate(queue) if i["id"] == item["id"]), None)
         if index is None:
             queue, index = [item], 0
-        PlayerDialog(queue, index, open_path, self).exec()
+        self.play_items(queue, index)
 
     def _show_count(self) -> None:
         if not (self.worker and self.worker.isRunning()):
@@ -1080,23 +1119,31 @@ class MainWindow(QMainWindow):
 
     def _context_menu(self, position) -> None:
         ids = self._selected_ids()
-        if not ids:
-            return
-        view = self.stack.currentWidget()
+        if ids:
+            view = self.stack.currentWidget()
+            self._item_menu(ids).exec(view.viewport().mapToGlobal(position))
+
+    def _item_menu(self, ids: list[int]) -> QMenu:
         menu = QMenu(self)
         paths = [full_path(self.catalog.get_item(i)) for i in ids]
         menu.addAction("Copiar ruta", lambda: QApplication.clipboard().setText("\n".join(paths)))
         if len(ids) > 1:
             menu.addAction("Editar varios…", lambda: self._bulk_edit(ids))
         menu.addAction("Añadir etiqueta…", lambda: self._bulk_tag(ids))
-        collection_menu = menu.addMenu("Añadir a colección")
+        collection_menu = menu.addMenu("Añadir a lista")
         for collection in self.catalog.collections():
-            collection_menu.addAction(collection["name"], lambda c=collection["id"]: self._add_to_collection(c, ids))
+            mark = "♫" if collection["kind"] == "playlist" else "▦"
+            collection_menu.addAction(f"{mark} {collection['name']}",
+                                      lambda c=collection["id"]: self._add_to_collection(c, ids))
         collection_menu.addSeparator()
+        collection_menu.addAction("Nueva playlist…", lambda: self._add_to_collection(None, ids, "playlist"))
         collection_menu.addAction("Nueva colección…", lambda: self._add_to_collection(None, ids))
         kind, value = self._current_filter()
         if kind == "collection":
-            menu.addAction("Quitar de esta colección", lambda: self._remove_from_collection(value, ids))
+            if self.model.natural == "list" and len(ids) == 1:
+                menu.addAction("Subir en la playlist", lambda: self._move_in_list(value, ids[0], -1))
+                menu.addAction("Bajar en la playlist", lambda: self._move_in_list(value, ids[0], 1))
+            menu.addAction("Quitar de esta lista", lambda: self._remove_from_collection(value, ids))
         rating = menu.addMenu("Valorar")
         for value in range(6):
             rating.addAction(stars(value) if value else "Sin valorar",
@@ -1104,7 +1151,7 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         menu.addAction("Escribir ediciones en archivo…", lambda: self._write_files(ids))
         menu.addAction("Quitar del catálogo…", lambda: self._remove_items(ids))
-        menu.exec(view.viewport().mapToGlobal(position))
+        return menu
 
     def _bulk_edit(self, ids) -> None:
         self.detail.commit()
@@ -1117,39 +1164,258 @@ class MainWindow(QMainWindow):
         self.reload()
         self.status_label.setText(f"Editados {len(ids)} elementos en el catálogo.")
 
-    def _add_to_collection(self, collection_id, ids) -> None:
+    def _add_to_collection(self, collection_id, ids, kind="collection") -> None:
         self.detail.commit()
         if collection_id is None:
-            name, ok = QInputDialog.getText(self, "Nueva colección", "Nombre:")
-            if not ok or not name.strip():
+            collection_id = self._create_list(kind)
+            if collection_id is None:
                 return
-            collection_id = self.catalog.create_collection(name)
-            self._refresh_sidebar()
         self.catalog.add_to_collection(collection_id, ids)
-        self.status_label.setText(f"Añadidos {len(ids)} elementos a la colección.")
+        self.status_label.setText(f"Añadidos {len(ids)} elementos a la lista.")
 
     def _remove_from_collection(self, collection_id, ids) -> None:
         self.detail.commit()
         self.catalog.remove_from_collection(collection_id, ids)
         self.reload()
 
-    def _sidebar_menu(self, position) -> None:
-        node = self.sidebar.itemAt(position)
-        data = node.data(0, Qt.ItemDataRole.UserRole) if node else None
-        if not data or data[0] != "collection":
+    def _move_in_list(self, collection_id: int, item_id: int, step: int) -> None:
+        self.detail.commit()
+        self.catalog.move_in_list(collection_id, item_id, step)
+        self.reload()
+        row = next(n for n, item in enumerate(self.model.items) if item["id"] == item_id)
+        self.grid.setCurrentIndex(self.model.index(row, 0))
+
+    # Menú de la barra lateral
+
+    def _ask_name(self, title: str, initial: str = "") -> str | None:
+        name, ok = QInputDialog.getText(self, title, "Nombre:", text=initial)
+        name = name.strip()
+        return name if ok and name else None
+
+    def _after_sidebar_change(self) -> None:
+        self.detail.commit()
+        self._refresh_sidebar()
+        self.reload()
+
+    def _create_list(self, kind: str, folder_id: int | None = None) -> int | None:
+        label = "playlist" if kind == "playlist" else "colección"
+        name = self._ask_name(f"Nueva {label}")
+        if not name:
+            return None
+        if self.catalog.list_name_exists(name):
+            QMessageBox.information(self, "Nombre ocupado", f"Ya hay una lista llamada «{name}».")
+            return None
+        collection_id = self.catalog.create_collection(name, kind, folder_id)
+        self._after_sidebar_change()
+        return collection_id
+
+    def _create_folder(self, parent_id: int | None = None) -> None:
+        name = self._ask_name("Nueva carpeta de listas")
+        if name:
+            self.catalog.create_folder(name, parent_id)
+            self._after_sidebar_change()
+
+    def _rename_list(self, collection_id: int) -> None:
+        current = self.catalog.collection(collection_id)["name"]
+        name = self._ask_name("Renombrar lista", current)
+        if not name:
             return
-        menu = QMenu(self)
-        menu.addAction("Borrar colección…", lambda: self._delete_collection(data[1], node.text(0)))
-        menu.exec(self.sidebar.viewport().mapToGlobal(position))
+        if self.catalog.list_name_exists(name, excluding=collection_id):
+            QMessageBox.information(self, "Nombre ocupado", f"Ya hay una lista llamada «{name}».")
+            return
+        self.catalog.rename_collection(collection_id, name)
+        self._after_sidebar_change()
 
     def _delete_collection(self, collection_id: int, name: str) -> None:
-        if dialogs.confirm(self, "Borrar colección", f"¿Borrar la colección «{name}»?\n\n"
-                                                     "Sus elementos siguen en el catálogo."):
+        if dialogs.confirm(self, "Borrar lista", f"¿Borrar la lista «{name}»?\n\n"
+                                                 "Sus elementos y archivos no se tocan."):
             self.detail.commit()
             self.catalog.delete_collection(collection_id)
             self.sidebar.clearSelection()
-            self._refresh_sidebar()
-            self.reload()
+            self._after_sidebar_change()
+
+    def _move_list(self, collection_id: int, folder_id: int | None) -> None:
+        self.catalog.move_collection(collection_id, folder_id)
+        self._after_sidebar_change()
+
+    def _rename_folder(self, folder_id: int, current: str) -> None:
+        name = self._ask_name("Renombrar carpeta", current)
+        if name:
+            self.catalog.rename_folder(folder_id, name)
+            self._after_sidebar_change()
+
+    def _move_folder(self, folder_id: int, parent_id: int | None) -> None:
+        self.catalog.move_folder(folder_id, parent_id)
+        self._after_sidebar_change()
+
+    def _delete_folder(self, folder_id: int, name: str) -> None:
+        if dialogs.confirm(self, "Borrar carpeta", f"¿Borrar la carpeta «{name}»?\n\n"
+                                                   "Las listas que contiene no se borran: suben un nivel."):
+            self.catalog.delete_folder(folder_id)
+            self._after_sidebar_change()
+
+    def _play_list(self, collection_id: int) -> None:
+        self.detail.commit()
+        place = {item_id: n for n, item_id in enumerate(self.catalog.list_order(collection_id))}
+        items = sorted(self.catalog.query_items(collection=collection_id), key=lambda i: place[i["id"]])
+        queue = [i for i in items if i["kind"] in PLAYABLE]
+        if not queue:
+            QMessageBox.information(self, "Nada que reproducir", "Esta lista no tiene vídeo, música ni fotos.")
+            return
+        self.play_items(queue, 0)
+
+    def _rename_tag(self, tag: str) -> None:
+        name = self._ask_name("Renombrar etiqueta", tag)
+        if name and name != tag:
+            self.catalog.rename_tag(tag, name)
+            self.sidebar.clearSelection()
+            self._after_sidebar_change()
+
+    def _delete_tag(self, tag: str) -> None:
+        if dialogs.confirm(self, "Borrar etiqueta", f"¿Quitar la etiqueta «{tag}» de todos sus elementos?"):
+            self.detail.commit()
+            self.catalog.delete_tag(tag)
+            self.sidebar.clearSelection()
+            self._after_sidebar_change()
+
+    def _rename_group(self, field: str, current: str) -> None:
+        label = "serie" if field == "series" else "álbum"
+        name = self._ask_name(f"Renombrar {label}", current)
+        if name and name != current:
+            self.detail.commit()
+            ids = [i["id"] for i in self.catalog.query_items(group=(field, current))]
+            self.catalog.bulk_edit(ids, {field: name})
+            self.sidebar.clearSelection()
+            self._after_sidebar_change()
+
+    def _set_root_mode(self, root_id: int, mode: str) -> None:
+        self.catalog.set_root_mode(root_id, mode)
+        self._after_sidebar_change()
+        self.status_label.setText("Carpeta asignada a Videos favoritos." if mode == "favorites"
+                                  else "La carpeta ya no es de Videos favoritos.")
+
+    def _relocate_root(self, root_id: int) -> None:
+        if self._busy():
+            return
+        path = QFileDialog.getExistingDirectory(self, "Nueva ubicación", self.catalog.root(root_id)["path"])
+        if path:
+            self.catalog.relocate_root(root_id, path)
+            self._after_sidebar_change()
+
+    def _remove_root(self, root_id: int) -> None:
+        if self._busy():
+            return
+        path = self.catalog.root(root_id)["path"]
+        if dialogs.confirm(self, "Quitar carpeta",
+                           f"¿Quitar {path} del catálogo?\n\nSe perderán sus etiquetas, valoraciones y ediciones "
+                           "no escritas. Los archivos no se tocan."):
+            self.detail.commit()
+            self.detail.show_item(None)
+            self.catalog.remove_root(root_id)
+            self.sidebar.clearSelection()
+            self._after_sidebar_change()
+
+    def _open_root(self, root_id: int) -> None:
+        path = self.catalog.root(root_id)["path"]
+        try:
+            open_path(path)
+        except OSError as exc:
+            QMessageBox.warning(self, "No se pudo abrir", f"{path}\n\n{exc}")
+
+    def _scan_root(self, root_id: int) -> None:
+        if not self._busy():
+            self.scan([root_id])
+
+    def _write_all_pending(self) -> None:
+        items = self.catalog.query_items()
+        self._write_files([i["id"] for i in items if metadata.pending_edits(i, full_path(i))])
+
+    def _remove_all_missing(self) -> None:
+        ids = [i["id"] for i in self.catalog.query_items(status="missing")]
+        if not ids:
+            QMessageBox.information(self, "Sin faltantes", "No hay elementos faltantes.")
+            return
+        self._remove_items(ids)
+
+    def _move_targets(self, move, excluded: set[int] = frozenset()) -> list:
+        targets = [("Sin carpeta", lambda: move(None))]
+        for folder in self.catalog.list_folders():
+            if folder["id"] not in excluded:
+                targets.append((folder["name"], lambda f=folder["id"]: move(f)))
+        return targets
+
+    def _sidebar_actions(self, data) -> list:
+        """Opciones de cada nodo: (texto, función), (texto, [subopciones]) o None como separador."""
+        kind, value = data
+        if kind == "section":
+            if value == "lists":
+                return [("Nueva playlist…", lambda: self._create_list("playlist")),
+                        ("Nueva colección…", lambda: self._create_list("collection")),
+                        ("Nueva carpeta…", self._create_folder)]
+            if value == "roots":
+                return [("Añadir carpeta…", lambda: self._add_root("auto")),
+                        ("Añadir carpeta de juegos…", lambda: self._add_root("games")),
+                        ("Escanear todas", self.scan_all),
+                        ("Gestionar carpetas…", self._manage_roots)]
+            if value == "library":
+                return [("Escanear todo", self.scan_all)]
+            return []
+        if kind in ("all", "kind"):
+            return [("Escanear todo", self.scan_all)]
+        if kind == "pending":
+            return [("Escribir todo en archivos…", self._write_all_pending)]
+        if kind == "missing":
+            return [("Quitar todos del catálogo…", self._remove_all_missing)]
+        if kind == "list_folder":
+            name = next(f["name"] for f in self.catalog.list_folders() if f["id"] == value)
+            return [("Nueva playlist aquí…", lambda: self._create_list("playlist", value)),
+                    ("Nueva colección aquí…", lambda: self._create_list("collection", value)),
+                    ("Nueva subcarpeta…", lambda: self._create_folder(value)), None,
+                    ("Renombrar…", lambda: self._rename_folder(value, name)),
+                    ("Mover a", self._move_targets(lambda p: self._move_folder(value, p),
+                                                   self.catalog.folder_descendants(value))),
+                    ("Borrar carpeta…", lambda: self._delete_folder(value, name))]
+        if kind == "collection":
+            info = self.catalog.collection(value)
+            play = [("Reproducir", lambda: self._play_list(value)), None]
+            return (play + [
+                ("Renombrar…", lambda: self._rename_list(value)),
+                ("Mover a", self._move_targets(lambda f: self._move_list(value, f))),
+                ("Borrar lista…", lambda: self._delete_collection(value, info["name"])),
+            ])
+        if kind == "tag":
+            return [("Renombrar…", lambda: self._rename_tag(value)),
+                    ("Borrar etiqueta…", lambda: self._delete_tag(value))]
+        if kind in ("series", "album"):
+            return [("Renombrar…", lambda: self._rename_group(kind, value))]
+        if kind == "root":
+            favorite = self.catalog.root(value)["mode"] == "favorites"
+            mode_action = (("Dejar de usar como Videos favoritos", lambda: self._set_root_mode(value, "auto"))
+                           if favorite else
+                           ("Usar como Videos favoritos", lambda: self._set_root_mode(value, "favorites")))
+            return [("Escanear esta carpeta", lambda: self._scan_root(value)), mode_action,
+                    ("Abrir en el explorador", lambda: self._open_root(value)), None,
+                    ("Cambiar ruta…", lambda: self._relocate_root(value)),
+                    ("Quitar del catálogo…", lambda: self._remove_root(value))]
+        return []
+
+    def _fill_menu(self, menu: QMenu, actions: list) -> None:
+        for action in actions:
+            if action is None:
+                menu.addSeparator()
+            elif isinstance(action[1], list):
+                self._fill_menu(menu.addMenu(action[0]), action[1])
+            else:
+                menu.addAction(action[0], action[1])
+
+    def _sidebar_menu(self, position) -> None:
+        node = self.sidebar.itemAt(position)
+        data = node.data(0, Qt.ItemDataRole.UserRole) if node else ("section", "lists")
+        actions = self._sidebar_actions(tuple(data)) if data else []
+        if actions:
+            menu = QMenu(self)
+            self._fill_menu(menu, actions)
+            menu.exec(self.sidebar.viewport().mapToGlobal(position))
 
     def _bulk_tag(self, ids) -> None:
         self.detail.commit()
@@ -1191,6 +1457,7 @@ class MainWindow(QMainWindow):
         self.cancel_button.hide()
         self._refresh_sidebar()
         self.reload()
+        self.data_changed()
 
     def _busy(self) -> bool:
         if self.worker:
@@ -1257,13 +1524,17 @@ class MainWindow(QMainWindow):
         worker.done.connect(self._write_done)
         self._start_worker(worker)
 
-    def _write_done(self, written: int, errors: list) -> None:
+    def _write_done(self, written: int, errors: list, verified: list) -> None:
         self._worker_finished()
-        self.status_label.setText(f"Escritos {written} archivo(s)")
+        self.status_label.setText(f"Escritos {written} archivo(s), comprobados al releerlos")
+        groups = []
+        if verified:
+            groups.append((f"Comprobado en el archivo ({len(verified)})", verified))
         if errors:
-            QMessageBox.warning(self, "Escritura incompleta",
-                                "Lo que no se pudo escribir sigue guardado en el catálogo:\n\n"
-                                + "\n".join(errors[:10]))
+            groups.append((f"Problemas ({len(errors)}): lo no escrito sigue en el catálogo", errors))
+        summary = ("Después de escribir, Mikoshi volvió a leer cada archivo. Estos son los valores que contiene "
+                   "ahora de verdad.")
+        dialogs.ReportDialog("Resultado de la escritura", summary, groups, lambda _p: None, self).exec()
 
     # Mantenimiento
 
@@ -1375,9 +1646,12 @@ class MainWindow(QMainWindow):
         if self.worker:
             self.worker.requestInterruption()
             self.worker.wait()
-        self.model.pool.clear()
-        self.model.pool.waitForDone()
+        for section in self.sections:
+            section.leave()
+        self.now_playing.stop()
+        self.thumbs.shutdown()
         dialogs.wait_for_tasks()
+        self.catalog.set_setting("tab", self.tabs.tabText(self.tabs.currentIndex()))
         self.catalog.set_setting("zoom", str(self.grid.iconSize().width()))
         self._automatic_backup()
         self.catalog.close()

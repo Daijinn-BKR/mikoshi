@@ -8,10 +8,11 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 import pytest
 from PIL import Image
 from PySide6.QtCore import QEventLoop, QTimer, Qt
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMenu, QMessageBox
 
 from mikoshi import metadata, scanner
 from mikoshi.db import Catalog
+from mikoshi.ui import stars
 
 
 def wait_until(condition, ms=30000):
@@ -28,6 +29,18 @@ def wait_until(condition, ms=30000):
 @pytest.fixture(scope="session")
 def app():
     return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def no_modal_popups(monkeypatch):
+    """Las ventanas modales bloquearían las pruebas: se registran en vez de mostrarse."""
+    from mikoshi import dialogs
+
+    shown = []
+    monkeypatch.setattr(dialogs.ReportDialog, "exec", lambda self: shown.append(self) or 0)
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: shown.append(a) or QMessageBox.StandardButton.Ok)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: shown.append(a) or QMessageBox.StandardButton.Ok)
+    return shown
 
 
 @pytest.fixture
@@ -294,6 +307,180 @@ def test_collection_menu_flow_and_delete(window, monkeypatch):
     assert window.catalog.collections() == [] and len(window.model.items) == 2
 
 
+def labels(actions):
+    return [a[0] for a in actions if a is not None]
+
+
+def fake_name(monkeypatch, text):
+    monkeypatch.setattr("mikoshi.ui.QInputDialog.getText", lambda *a, **k: (text, True))
+
+
+def yes(monkeypatch):
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+
+
+def sidebar_data(win):
+    found = []
+
+    def walk(node):
+        found.append(tuple(node.data(0, Qt.ItemDataRole.UserRole)))
+        for n in range(node.childCount()):
+            walk(node.child(n))
+
+    for t in range(win.sidebar.topLevelItemCount()):
+        walk(win.sidebar.topLevelItem(t))
+    return found
+
+
+def test_every_sidebar_node_has_valid_menu(window, monkeypatch):
+    scan(window)
+    item = window.catalog.query_items()[0]
+    window.catalog.add_tag([item["id"]], "retro")
+    folder = window.catalog.create_folder("Viajes")
+    window.catalog.create_collection("Mix", "playlist", folder)
+    window.catalog.save_user_data(item["id"], edits={"series": "Dark", "album": "Uno"})
+    window._after_sidebar_change()
+    data = sidebar_data(window)
+    expected = {("list_folder", folder), ("tag", "retro"), ("series", "Dark"), ("album", "Uno"),
+                ("section", "lists"), ("section", "roots"), ("all", None), ("pending", None), ("missing", None)}
+    assert expected <= set(data)
+    for node in data:
+        actions = window._sidebar_actions(node)
+        menu = QMenu()
+        window._fill_menu(menu, actions)
+    assert "Nueva playlist…" in labels(window._sidebar_actions(("section", "lists")))
+    assert "Nueva carpeta…" in labels(window._sidebar_actions(("section", "lists")))
+
+
+def test_create_rename_move_delete_folder_and_playlist(window, monkeypatch):
+    scan(window)
+    fake_name(monkeypatch, "Vacaciones")
+    window._create_folder()
+    folder = window.catalog.list_folders()[0]["id"]
+    fake_name(monkeypatch, "Mix")
+    pid = window._create_list("playlist", folder)
+    assert ("collection", pid) in sidebar_data(window)
+    assert window.catalog.collection(pid)["folder_id"] == folder
+
+    fake_name(monkeypatch, "Mix 2")
+    window._rename_list(pid)
+    assert window.catalog.collection(pid)["name"] == "Mix 2"
+    window._move_list(pid, None)
+    assert window.catalog.collection(pid)["folder_id"] is None
+    window._move_list(pid, folder)
+
+    yes(monkeypatch)
+    window._delete_folder(folder, "Vacaciones")
+    assert window.catalog.list_folders() == [] and window.catalog.collection(pid)["folder_id"] is None
+    window._delete_collection(pid, "Mix 2")
+    assert window.catalog.collections() == []
+    assert len(window.catalog.query_items()) == 2
+
+
+def test_duplicate_list_name_is_refused(window, monkeypatch):
+    window.catalog.create_collection("Mix")
+    fake_name(monkeypatch, "mix")
+    shown = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: shown.append(a[2]))
+    assert window._create_list("playlist") is None
+    assert len(window.catalog.collections()) == 1 and shown
+
+
+def test_playlist_view_keeps_order_despite_title_sort(window):
+    (window.lib / "a.gba").write_bytes(b"xx")
+    scan(window)
+    ids = {i["rel_path"]: i["id"] for i in window.catalog.query_items()}
+    pid = window.catalog.create_collection("Mix", "playlist")
+    window.catalog.add_to_collection(pid, [ids["zelda.gba"], ids["a.gba"]])
+    window._after_sidebar_change()
+    choose(window, "collection", pid)
+    assert [i["rel_path"] for i in window.model.items] == ["zelda.gba", "a.gba"]
+    window._move_in_list(pid, ids["a.gba"], -1)
+    assert [i["rel_path"] for i in window.model.items] == ["a.gba", "zelda.gba"]
+    assert window.detail.item["id"] == ids["a.gba"]
+
+
+def test_play_list_opens_only_playable_in_order(window, monkeypatch):
+    scan(window)
+    ids = {i["rel_path"]: i["id"] for i in window.catalog.query_items()}
+    pid = window.catalog.create_collection("Mix", "playlist")
+    window.catalog.add_to_collection(pid, [ids["zelda.gba"], ids["foto.jpg"]])
+    opened = []
+    monkeypatch.setattr("mikoshi.ui.PlayerDialog.exec", lambda self: opened.append([i["rel_path"] for i in self.items]))
+    window._play_list(pid)
+    assert opened == [["foto.jpg"]]
+    empty = window.catalog.create_collection("Vacía", "playlist")
+    shown = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: shown.append(a[1]))
+    window._play_list(empty)
+    assert shown == ["Nada que reproducir"]
+
+
+def test_sidebar_rename_series_and_remove_root_touch_no_files(window, monkeypatch):
+    scan(window)
+    item = window.catalog.query_items()[0]
+    window.catalog.save_user_data(item["id"], edits={"series": "Dark"})
+    fake_name(monkeypatch, "Oscuro")
+    window._rename_group("series", "Dark")
+    assert window.catalog.group_names("series") == ["Oscuro"]
+
+    yes(monkeypatch)
+    root = window.catalog.roots()[0]["id"]
+    window._remove_root(root)
+    assert window.catalog.query_items() == []
+    assert (window.lib / "zelda.gba").exists() and (window.lib / "foto.jpg").exists()
+
+
+def find_action(menu, text):
+    for action in menu.actions():
+        if action.text() == text:
+            return action
+        if action.menu():
+            found = find_action(action.menu(), text)
+            if found:
+                return found
+    return None
+
+
+def test_real_sidebar_menu_actions_get_correct_arguments(window, monkeypatch):
+    fake_name(monkeypatch, "Raíz")
+    menu = QMenu()
+    window._fill_menu(menu, window._sidebar_actions(("section", "lists")))
+    find_action(menu, "Nueva carpeta…").trigger()
+    top = window.catalog.list_folders()[0]
+    assert top["parent_id"] is None
+
+    other = window.catalog.create_folder("Destino")
+    pid = window.catalog.create_collection("Mix", "playlist", other)
+    window._after_sidebar_change()
+    menu = QMenu()
+    window._fill_menu(menu, window._sidebar_actions(("collection", pid)))
+    find_action(menu, "Raíz").trigger()
+    assert window.catalog.collection(pid)["folder_id"] == top["id"]
+    menu = QMenu()
+    window._fill_menu(menu, window._sidebar_actions(("collection", pid)))
+    find_action(menu, "Sin carpeta").trigger()
+    assert window.catalog.collection(pid)["folder_id"] is None
+
+
+def test_real_item_menu_rates_and_adds_to_list(window, monkeypatch):
+    scan(window)
+    select(window, "zelda")
+    ids = window._selected_ids()
+    pid = window.catalog.create_collection("Mix", "playlist")
+    menu = window._item_menu(ids)
+    find_action(menu, stars(4)).trigger()
+    assert window.catalog.get_item(ids[0])["rating"] == 4
+    select(window, "zelda")
+    menu = window._item_menu(ids)
+    find_action(menu, "♫ Mix").trigger()
+    assert window.catalog.list_order(pid) == ids
+
+
+def test_right_click_on_empty_space_offers_creating_lists(window):
+    assert "Nueva playlist…" in labels(window._sidebar_actions(("section", "lists")))
+
+
 def test_automatic_backup_runs_once_a_day_and_reports_failure(window, tmp_path):
     copy = tmp_path / "copia"
     copy.mkdir()
@@ -364,6 +551,7 @@ def test_player_shows_image_and_navigates(window):
 
 def test_player_handles_missing_and_broken_files(window):
     scan(window)
+    window.model.pool.waitForDone()
     (window.lib / "foto.jpg").unlink()
     dialog = player_for(window, "foto")
     assert dialog.stage.currentWidget() is dialog.message and "servidor" in dialog.message.text()
