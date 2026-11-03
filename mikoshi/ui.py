@@ -79,7 +79,7 @@ class WriteWorker(QThread):
                 break
             item = catalog.get_item(item_id)
             name = Path(item["rel_path"]).name
-            labels = dict(metadata.FIELDS[item["kind"]])
+            labels = metadata.field_labels(item["kind"])
             self.progress.emit(f"Escribiendo {index}/{len(self.item_ids)} · {name}")
             try:
                 # Lo confirmado se ha vuelto a leer del archivo después de escribirlo.
@@ -483,7 +483,8 @@ class DetailPanel(QScrollArea):
             self.warning.show()
         meta = effective(item)
         can_write = metadata.writable_fields(path, item["kind"])
-        for key, label in metadata.FIELDS[item["kind"]]:
+        favorite = item["root_id"] in self.catalog.favorite_root_ids()
+        for key, label in metadata.fields_for(item["kind"], favorite):
             if key == "description":
                 widget = QPlainTextEdit(meta.get(key, ""))
                 widget.setFixedHeight(80)

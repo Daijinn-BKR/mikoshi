@@ -35,8 +35,12 @@ Mikoshi se organiza en pestañas, cada una con su propio diseño:
   año, orden por álbum y pista, y una barra de reproducción fija con cola,
   aleatorio y repetición que sigue sonando mientras navegas.
 - **Videos favoritos** (al estilo de YouTube): cuadrícula 16:9 con duración,
-  página de reproducción y «A continuación». Usa la carpeta marcada como de
-  favoritos; si una sola carpeta se llama así, se asigna sola.
+  página de reproducción con «A continuación» y pantalla completa (doble clic,
+  F o F11; Esc para salir), y canales por autor. Una reproducción cuenta al ver
+  el 95 % del vídeo, y al volver a uno sin terminar pregunta si continuar o
+  empezar de nuevo. Clic derecho en un vídeo para editar, ver su canal o marcarlo
+  como visto. Usa la carpeta marcada como de favoritos; si una sola carpeta se
+  llama así, se asigna sola.
 - **Libros** (al estilo de Calibre): explorador por autor, serie, género,
   editorial y etiqueta, tabla y ficha con portada y descripción.
 - **Juegos** (al estilo de Steam): biblioteca de portadas a partir de los

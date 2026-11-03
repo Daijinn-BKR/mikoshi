@@ -10,7 +10,7 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QMenu, QPushButton, QSlider, QVBoxLayout, QWidget
 
 from .db import display_title, effective, full_path
-from .player import format_time
+from .player import SeekSlider, format_time
 from .widgets import draw_cover
 
 REPEAT_MODES = [("off", "Repetir: no"), ("all", "Repetir: todo"), ("one", "Repetir: una")]
@@ -56,7 +56,7 @@ class NowPlayingBar(QWidget):
         self.play_button.setProperty("primary", True)
         self.next_button = QPushButton("⏭")
         self.repeat_button = QPushButton(REPEAT_MODES[0][1])
-        self.position = QSlider(Qt.Orientation.Horizontal)
+        self.position = SeekSlider()
         self.time_label = QLabel("0:00 / 0:00")
         self.time_label.setProperty("muted", True)
         self.volume = QSlider(Qt.Orientation.Horizontal)

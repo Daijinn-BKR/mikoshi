@@ -22,7 +22,7 @@ from . import dialogs, online, thumbnails
 from .db import display_title, effective, full_path
 from .player import PlayerHooks, PlayerWidget
 from .widgets import (
-    POSTER, WIDE, CardModel, card_view, clock, draw_cover, human_size, number, open_path,
+    POSTER, SQUARE, WIDE, CardModel, card_view, clock, draw_cover, human_size, number, open_path,
     reveal_path, seconds, stars, video_category, year, ago,
 )
 
@@ -1173,35 +1173,161 @@ class FavoritesSection(Section):
         self.videos: list[dict] = []
         self.activity: dict = {}
 
+        self.current_channel: str | None = None
+        self.return_page: QWidget | None = None
+
         self.chips = {name: chip(name) for name in self.SORTS}
         self.chips["Recientes"].setChecked(True)
+        self.channels_button = QPushButton("Canales")
         self.search = QLineEdit(placeholderText="Buscar en tus videos…", clearButtonEnabled=True)
         self.search.setMaximumWidth(380)
         top = QHBoxLayout()
         for button in self.chips.values():
             top.addWidget(button)
+        top.addSpacing(12)
+        top.addWidget(self.channels_button)
         top.addStretch()
         top.addWidget(self.search)
-        self.model = CardModel(self.thumbs, subtitle=self._subtitle, badge=lambda i: clock(seconds(i)),
-                               progress=self._progress)
+        self.model = self._video_model()
         self.grid = card_view(self.model, 280, WIDE)
         grid = QVBoxLayout()
         grid.addLayout(top)
         grid.addWidget(self.grid, 1)
-        grid_page = QWidget()
-        grid_page.setLayout(grid)
+        self.grid_page = QWidget()
+        self.grid_page.setLayout(grid)
 
         self.setup_page = self._build_setup_page()
         self.watch_page = self._build_watch_page()
+        self.channels_page = self._build_channels_page()
+        self.channel_page = self._build_channel_page()
         self.pages = QStackedWidget()
-        for page in (grid_page, self.watch_page, self.setup_page):
+        for page in (self.grid_page, self.watch_page, self.setup_page, self.channels_page, self.channel_page):
             self.pages.addWidget(page)
         QVBoxLayout(self).addWidget(self.pages)
 
         for name, button in self.chips.items():
             button.clicked.connect(lambda _c=False, n=name: self._set_sort(n))
+        self.channels_button.clicked.connect(self.show_channels)
         self.search.textChanged.connect(lambda _t: self._apply())
-        self.grid.clicked.connect(lambda index: self.watch(self.model.items, index.row()))
+        self._connect_video_grid(self.grid, self.model)
+
+    def _video_model(self) -> CardModel:
+        return CardModel(self.thumbs, subtitle=self._subtitle, badge=lambda i: clock(seconds(i)),
+                         progress=self._progress)
+
+    def _connect_video_grid(self, view, model) -> None:
+        view.clicked.connect(lambda index: self.watch(model.items, index.row()))
+        view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        view.customContextMenuRequested.connect(
+            lambda position: self._grid_menu(view, model, position))
+
+    @staticmethod
+    def channel_of(item: dict) -> str:
+        return effective(item).get("artist", "").strip() or "Sin autor"
+
+    def channels(self) -> dict[str, list[dict]]:
+        found: dict[str, list[dict]] = defaultdict(list)
+        for video in self.sorted_videos():
+            found[self.channel_of(video)].append(video)
+        return found
+
+    def _build_channels_page(self) -> QWidget:
+        back = QPushButton("← Videos")
+        back.clicked.connect(lambda: self.pages.setCurrentWidget(self.grid_page))
+        top = QHBoxLayout()
+        top.addWidget(back)
+        top.addWidget(heading("Canales"))
+        top.addStretch()
+        self.channels_model = CardModel(self.thumbs, title=lambda c: c["name"],
+                                        subtitle=lambda c: f"{len(c['videos'])} videos")
+        self.channels_model.cover_of = lambda c: c["videos"][0]
+        self.channels_grid = card_view(self.channels_model, 180, SQUARE)
+        self.channels_grid.clicked.connect(
+            lambda index: self.show_channel(self.channels_model.items[index.row()]["name"]))
+        layout = QVBoxLayout()
+        layout.addLayout(top)
+        layout.addWidget(self.channels_grid, 1)
+        page = QWidget()
+        page.setLayout(layout)
+        return page
+
+    def _build_channel_page(self) -> QWidget:
+        back = QPushButton("← Canales")
+        back.clicked.connect(self.show_channels)
+        self.channel_title = heading("")
+        self.channel_meta = muted()
+        top = QHBoxLayout()
+        top.addWidget(back)
+        top.addWidget(self.channel_title)
+        top.addWidget(self.channel_meta)
+        top.addStretch()
+        self.channel_model = self._video_model()
+        self.channel_grid = card_view(self.channel_model, 280, WIDE)
+        self._connect_video_grid(self.channel_grid, self.channel_model)
+        layout = QVBoxLayout()
+        layout.addLayout(top)
+        layout.addWidget(self.channel_grid, 1)
+        page = QWidget()
+        page.setLayout(layout)
+        return page
+
+    def show_channels(self) -> None:
+        self.current_channel = None
+        found = self.channels()
+        self.channels_model.set_items([{"name": name, "videos": videos}
+                                       for name, videos in sorted(found.items(), key=lambda kv: kv[0].casefold())])
+        self.pages.setCurrentWidget(self.channels_page)
+
+    def show_channel(self, name: str) -> None:
+        if self.pages.currentWidget() is self.watch_page:
+            self.player.stop()
+        self.current_channel = name
+        videos = self.channels().get(name, [])
+        self.channel_title.setText(name)
+        total = sum(seconds(v) for v in videos)
+        self.channel_meta.setText(f"{len(videos)} videos · {clock(total) or '0:00'}")
+        self.channel_model.set_items(videos)
+        self.pages.setCurrentWidget(self.channel_page)
+
+    def ask_resume(self, item: dict, position_ms: int) -> bool:
+        """Pregunta si se sigue donde se dejó. True: continuar; False: desde el principio."""
+        box = QMessageBox(self)
+        box.setWindowTitle("Continuar viendo")
+        box.setText(f"Dejaste «{display_title(item)}» en {clock(position_ms // 1000)}.")
+        resume = box.addButton(f"Continuar desde {clock(position_ms // 1000)}", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Desde el principio", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(resume)
+        box.exec()
+        return box.clickedButton() is resume
+
+    def video_menu(self, items: list[dict], row: int) -> QMenu:
+        item = items[row]
+        stats = self.activity.get(item["id"], {})
+        menu = QMenu(self)
+        menu.addAction("Reproducir", lambda: self.watch(items, row))
+        if stats.get("position_ms") and not stats.get("watched"):
+            menu.addAction("Reproducir desde el principio", lambda: self.watch(items, row, resume=False))
+        menu.addAction("Editar metadatos…", lambda: self.edit(item))
+        channel = self.channel_of(item)
+        menu.addAction(f"Ver canal «{channel}»", lambda: self.show_channel(channel))
+        menu.addSeparator()
+        watched = bool(stats.get("watched"))
+        menu.addAction("Marcar como no visto" if watched else "Marcar como visto",
+                       lambda: (self.catalog.set_watched(item["id"], not watched), self.refresh()))
+        if stats.get("position_ms"):
+            menu.addAction("Olvidar por dónde iba",
+                           lambda: (self.catalog.set_watched(item["id"], False), self.refresh()))
+        menu.addAction("Ver en carpeta", lambda: reveal_path(full_path(item)))
+        more = self.main._item_menu([item["id"]])
+        more.setTitle("Más opciones")
+        menu.addMenu(more)
+        return menu
+
+    def _grid_menu(self, view, model, position) -> None:
+        index = view.indexAt(position)
+        if index.isValid():
+            view.setCurrentIndex(index)
+            self.video_menu(model.items, index.row()).exec(view.viewport().mapToGlobal(position))
 
     def _build_setup_page(self) -> QWidget:
         page = QWidget()
@@ -1225,20 +1351,27 @@ class FavoritesSection(Section):
         self.watch_title.setWordWrap(True)
         self.watch_meta = muted()
         self.watch_description = muted()
+        self.channel_button = QPushButton()
+        self.channel_button.setProperty("chip", True)
+        self.channel_button.setToolTip("Ver todos los videos de este autor")
         back = QPushButton("← Volver")
-        edit = QPushButton("Editar…")
+        edit = QPushButton("Editar metadatos…")
         folder = QPushButton("Ver en carpeta")
+        top = QHBoxLayout()
+        top.addWidget(back)
+        top.addStretch()
         buttons = QHBoxLayout()
-        buttons.addWidget(back)
+        buttons.addWidget(self.channel_button)
         buttons.addStretch()
         buttons.addWidget(edit)
         buttons.addWidget(folder)
         left = QVBoxLayout()
+        left.addLayout(top)
         left.addWidget(self.player, 1)
         left.addWidget(self.watch_title)
+        left.addLayout(buttons)
         left.addWidget(self.watch_meta)
         left.addWidget(self.watch_description)
-        left.addLayout(buttons)
         self.up_next = QListWidget()
         self.up_next.setIconSize(QSize(168, 94))
         self.up_next.setFixedWidth(400)
@@ -1252,6 +1385,7 @@ class FavoritesSection(Section):
         page = QWidget()
         page.setLayout(row)
         back.clicked.connect(self._back)
+        self.channel_button.clicked.connect(lambda: self.show_channel(self.channel_of(self.player.item)))
         edit.clicked.connect(self._edit_playing)
         folder.clicked.connect(lambda: self.player.items and reveal_path(full_path(self.player.item)))
         self.up_next.itemClicked.connect(lambda entry: self.player.go(entry.data(Qt.ItemDataRole.UserRole)))
@@ -1277,8 +1411,10 @@ class FavoritesSection(Section):
             self.pages.setCurrentWidget(self.setup_page)
             return
         if self.pages.currentWidget() is self.setup_page:
-            self.pages.setCurrentIndex(0)
+            self.pages.setCurrentWidget(self.grid_page)
         self._apply()
+        if self.pages.currentWidget() is self.channel_page and self.current_channel:
+            self.show_channel(self.current_channel)
 
     def _adopt_named_folder(self) -> set[int]:
         """Si una sola carpeta se llama como «Videos favoritos», se usa sin preguntar."""
@@ -1333,11 +1469,16 @@ class FavoritesSection(Section):
     def _apply(self) -> None:
         self.model.set_items(self.sorted_videos())
 
-    def watch(self, items: list[dict], index: int) -> None:
+    def watch(self, items: list[dict], index: int, resume: bool = True) -> None:
         self.main.now_playing.pause()
-        self.player.hooks = PlayerHooks(self.catalog, resume=True)
+        # Como en YouTube: una reproducción cuenta al ver el 95 % del vídeo, no al abrirlo.
+        self.player.hooks = PlayerHooks(self.catalog, resume=resume, count_at=0.95, ask_resume=self.ask_resume)
+        if self.pages.currentWidget() is not self.watch_page:
+            self.return_page = self.pages.currentWidget()
         self.pages.setCurrentWidget(self.watch_page)
         self.player.set_queue(list(items), index)
+        # Solo el vídeo elegido puede empezar desde el principio; los siguientes vuelven a preguntar.
+        self.player.hooks.resume = True
 
     def _show_info(self, item: dict) -> None:
         self.watch_title.setText(display_title(item))
@@ -1346,6 +1487,7 @@ class FavoritesSection(Section):
         self.watch_meta.setText(" · ".join(p for p in (f"{plays} reproducciones", ago(item["added_at"]),
                                                        clock(seconds(item)), human_size(item["size"])) if p))
         self.watch_description.setText(meta.get("description", ""))
+        self.channel_button.setText(self.channel_of(item))
         self.icons.clear(self.up_next)
         self.up_next.clear()
         for offset, video in enumerate(self.player.items[self.player.index + 1:self.player.index + 30], 1):
@@ -1361,8 +1503,11 @@ class FavoritesSection(Section):
 
     def _back(self) -> None:
         self.player.stop()
-        self.pages.setCurrentIndex(0)
         self.refresh()
+        if self.return_page is self.channel_page and self.current_channel:
+            self.show_channel(self.current_channel)
+        else:
+            self.pages.setCurrentWidget(self.grid_page)
 
     def release(self, paths: set[str]) -> bool:
         return self.player.release(paths)

@@ -5,8 +5,8 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 import pytest
 from PIL import Image
-from PySide6.QtCore import QEventLoop, QTimer
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtCore import QEventLoop, Qt, QTimer
+from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
 
 from mikoshi import dialogs, metadata, online, scanner
 from mikoshi.db import Catalog, effective
@@ -291,10 +291,10 @@ def test_favorites_youtube_grid_and_watch(window):
     favorites.watch(favorites.model.items, 0)
     assert favorites.pages.currentWidget() is favorites.watch_page
     assert favorites.watch_title.text() == "clip dos" and favorites.up_next.count() == 1
-    assert favorites.watch_meta.text().startswith("1 reproducciones")
+    # Abrir un vídeo todavía no cuenta como reproducción.
+    assert favorites.watch_meta.text().startswith("0 reproducciones")
     wait_until(lambda: favorites.player.player.duration() > 0)
     favorites._back()
-    assert window.catalog.activity()[favorites.model.items[0]["id"]]["play_count"] >= 1
     cinema = section(window, "Películas y series")
     assert "clip" not in " ".join(titles(cinema.movie_model.items))
 
@@ -483,3 +483,189 @@ def test_book_html_description_is_rendered_not_shown_raw(window):
     books.refresh()
     books.table.selectRow(0)
     assert books.description.toPlainText().strip() == "Primera edición"
+
+
+
+def favorites_with_root(window):
+    favorites = section(window, "Videos favoritos")
+    favorites.refresh()
+    return favorites
+
+
+def test_favorite_edit_form_has_channel_and_no_film_fields(window):
+    favorites = favorites_with_root(window)
+    video = favorites.model.items[0]
+    window.detail.show_item(window.catalog.get_item(video["id"]))
+    assert list(window.detail.inputs) == ["title", "artist", "year", "genre", "description"]
+    movie = next(v for v in window.catalog.query_items(kind="video") if "Blade" in v["rel_path"])
+    window.detail.show_item(movie)
+    assert {"director", "series", "season", "episode"} <= set(window.detail.inputs)
+
+
+def test_channel_is_written_to_file_and_groups_videos(window, monkeypatch):
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    favorites = favorites_with_root(window)
+    videos = favorites.model.items
+    for video in videos:
+        window.catalog.save_user_data(video["id"], edits={"artist": "Canal Uno"})
+    window._write_files([v["id"] for v in videos])
+    wait_until(lambda: window.worker is None, 30000)
+    for video in videos:
+        path = os.path.join(video["root_path"], video["rel_path"])
+        assert metadata.read_file(path, "video")[0]["artist"] == "Canal Uno"
+    favorites.refresh()
+    assert list(favorites.channels()) == ["Canal Uno"]
+    favorites.show_channels()
+    assert [c["name"] for c in favorites.channels_model.items] == ["Canal Uno"]
+    favorites.show_channel("Canal Uno")
+    assert favorites.pages.currentWidget() is favorites.channel_page
+    assert len(favorites.channel_model.items) == 2 and "2 videos" in favorites.channel_meta.text()
+    favorites.watch(favorites.channel_model.items, 0)
+    assert favorites.channel_button.text() == "Canal Uno"
+    favorites._back()
+    assert favorites.pages.currentWidget() is favorites.channel_page
+    # Los vídeos de ejemplo se comparten entre pruebas: se deja el autor como estaba.
+    for video in videos:
+        window.catalog.save_user_data(video["id"], edits={"artist": ""})
+    window._write_files([v["id"] for v in videos])
+    wait_until(lambda: window.worker is None, 30000)
+
+
+def test_videos_without_author_share_a_channel(window):
+    favorites = favorites_with_root(window)
+    assert list(favorites.channels()) == ["Sin autor"]
+
+
+def test_play_counts_only_after_95_percent(window):
+    from mikoshi.player import PlayerHooks
+
+    favorites = favorites_with_root(window)
+    video = favorites.model.items[0]
+    hooks = PlayerHooks(window.catalog, count_at=0.95)
+    hooks.played(video)
+    assert window.catalog.activity().get(video["id"], {}).get("play_count", 0) == 0
+    assert not hooks.reached(940, 1000) and hooks.reached(950, 1000)
+    favorites.watch(favorites.model.items, 0)
+    player = favorites.player
+    wait_until(lambda: player.player.duration() > 0)
+    player._position_changed(int(player.player.duration() * 0.5))
+    assert window.catalog.activity().get(video["id"], {}).get("play_count", 0) == 0
+    player._position_changed(int(player.player.duration() * 0.96))
+    player._position_changed(player.player.duration())
+    assert window.catalog.activity()[video["id"]]["play_count"] == 1
+    favorites._back()
+
+
+def test_unfinished_video_asks_to_resume_or_restart(window, monkeypatch):
+    favorites = favorites_with_root(window)
+    video = favorites.model.items[0]
+    window.catalog.save_progress(video["id"], 1500, 3000)
+    asked = []
+    monkeypatch.setattr(favorites, "ask_resume", lambda item, ms: asked.append(ms) or False)
+    favorites.watch(favorites.model.items, 0)
+    assert asked == [1500] and favorites.player.pending_seek == 0
+    favorites._back()
+    window.catalog.save_progress(video["id"], 1500, 3000)
+    monkeypatch.setattr(favorites, "ask_resume", lambda item, ms: asked.append(ms) or True)
+    favorites.watch(favorites.model.items, 0)
+    assert favorites.player.pending_seek == 1500 or favorites.player.player.position() >= 1000
+    favorites._back()
+    asked.clear()
+    window.catalog.set_watched(video["id"], True)
+    favorites.watch(favorites.model.items, 0)
+    assert asked == []
+    favorites._back()
+
+
+def test_restart_option_skips_question(window, monkeypatch):
+    favorites = favorites_with_root(window)
+    video = favorites.model.items[0]
+    window.catalog.save_progress(video["id"], 1500, 3000)
+    monkeypatch.setattr(favorites, "ask_resume", lambda item, ms: pytest.fail("no debía preguntar"))
+    favorites.refresh()
+    menu = favorites.video_menu(favorites.model.items, 0)
+    next(a for a in menu.actions() if a.text() == "Reproducir desde el principio").trigger()
+    assert favorites.player.pending_seek == 0
+    favorites._back()
+
+
+def test_right_click_menu_offers_video_actions(window):
+    favorites = favorites_with_root(window)
+    labels = [a.text() for a in favorites.video_menu(favorites.model.items, 0).actions() if a.text()]
+    for expected in ("Reproducir", "Editar metadatos…", "Ver canal «Sin autor»", "Marcar como visto",
+                     "Ver en carpeta", "Más opciones"):
+        assert expected in labels
+    menu = favorites.video_menu(favorites.model.items, 0)
+    next(a for a in menu.actions() if a.text() == "Marcar como visto").trigger()
+    assert window.catalog.activity()[favorites.model.items[0]["id"]]["watched"] == 1 or any(
+        s.get("watched") for s in window.catalog.activity().values())
+
+
+def test_back_button_is_top_left_on_watch_page(window):
+    favorites = favorites_with_root(window)
+    favorites.watch(favorites.model.items, 0)
+    favorites.resize(1200, 800)
+    window.resize(1400, 900)
+    back = next(b for b in favorites.watch_page.findChildren(QPushButton) if b.text() == "← Volver")
+    position = back.mapTo(favorites.watch_page, back.rect().topLeft())
+    assert position.y() < 60 and position.x() < 60
+    favorites._back()
+
+
+def test_fullscreen_fills_the_window_and_restores_everything(window):
+    favorites = favorites_with_root(window)
+    favorites.watch(favorites.model.items, 0)
+    player = favorites.player
+    others = [window.tabs.tabBar(), window.menuBar(), favorites.up_next, favorites.watch_title,
+              favorites.channel_button, window.statusBar()]
+    assert all(w.isVisible() for w in others)
+    player.toggle_fullscreen()
+    # No se abre ninguna ventana nueva: es la de Mikoshi la que ocupa la pantalla.
+    assert player.immersive and not player.video.isWindow()
+    assert window.windowState() & Qt.WindowState.WindowFullScreen
+    assert not any(w.isVisible() for w in others)
+    assert player.video.isVisible() and player.position.isVisible()
+    assert player.fullscreen_button.text() == "Salir de pantalla completa"
+    player.toggle_fullscreen()
+    assert not player.immersive and all(w.isVisible() for w in others)
+    assert not window.windowState() & Qt.WindowState.WindowFullScreen
+    player.toggle_fullscreen()
+    favorites._back()
+    assert not player.immersive and window.tabs.tabBar().isVisible()
+
+
+def test_escape_and_double_click_toggle_fullscreen(window):
+    from PySide6.QtTest import QTest
+
+    favorites = favorites_with_root(window)
+    favorites.watch(favorites.model.items, 0)
+    player = favorites.player
+    QTest.mouseDClick(player.video, Qt.MouseButton.LeftButton)
+    assert player.immersive
+    QTest.keyClick(player.video, Qt.Key.Key_Escape)
+    assert not player.immersive
+    favorites._back()
+
+
+def test_clicking_progress_bar_jumps_there(window):
+    from PySide6.QtCore import QPoint
+    from PySide6.QtTest import QTest
+    from mikoshi.player import SeekSlider
+
+    slider = SeekSlider()
+    slider.setRange(0, 1000)
+    slider.resize(400, 20)
+    slider.show()
+    jumped = []
+    slider.sliderReleased.connect(lambda: jumped.append(slider.value()))
+    QTest.mouseClick(slider, Qt.MouseButton.LeftButton, pos=QPoint(300, 10))
+    assert 700 <= slider.value() <= 800 and jumped == [slider.value()]
+
+    favorites = favorites_with_root(window)
+    favorites.watch(favorites.model.items, 0)
+    player = favorites.player
+    wait_until(lambda: player.player.duration() > 0)
+    bar = player.position
+    QTest.mouseClick(bar, Qt.MouseButton.LeftButton, pos=QPoint(bar.width() // 2, bar.height() // 2))
+    wait_until(lambda: abs(player.player.position() - player.player.duration() // 2) < player.player.duration() * 0.15)
+    favorites._back()

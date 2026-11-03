@@ -43,6 +43,10 @@ FIELDS = {
              ("genre", "Género"), ("description", "Descripción")],
 }
 
+# Los videos favoritos son clips, no películas: autor o canal en vez de dirección, serie y episodios.
+FAVORITE_FIELDS = [("title", "Título"), ("artist", "Autor / canal"), ("year", "Año"), ("genre", "Género"),
+                   ("description", "Descripción")]
+
 CREATOR_KEYS = ("artist", "author", "director", "developer")
 # Campos con opciones fijas: (valor guardado, texto visible). "" es automático.
 CHOICES = {"category": [("", "Automática"), ("movie", "Película"), ("series", "Episodio de serie")]}
@@ -50,7 +54,7 @@ CHOICES = {"category": [("", "Automática"), ("movie", "Película"), ("series", 
 _EASY_AUDIO = {"title": "title", "artist": "artist", "album": "album", "year": "date",
                "track": "tracknumber", "genre": "genre"}
 _AUDIO_WRITABLE = {".mp3", ".flac", ".ogg", ".oga", ".opus", ".m4a"}
-_VIDEO_KEYS = {"title": "title", "year": "date", "genre": "genre", "description": "description",
+_VIDEO_KEYS = {"title": "title", "artist": "artist", "year": "date", "genre": "genre", "description": "description",
                "director": "director", "series": "show", "season": "season_number", "episode": "episode_sort"}
 _VIDEO_WRITABLE = {
     ".mkv": set(_VIDEO_KEYS),
@@ -79,13 +83,25 @@ def writable_fields(path: str, kind: str) -> set[str]:
     return set()
 
 
+def fields_for(kind: str, favorite: bool = False) -> list[tuple[str, str]]:
+    return FAVORITE_FIELDS if kind == "video" and favorite else FIELDS[kind]
+
+
+def field_labels(kind: str) -> dict[str, str]:
+    """Todos los nombres de campo de un tipo, incluidos los de favoritos."""
+    labels = dict(FIELDS[kind])
+    if kind == "video":
+        labels.update(FAVORITE_FIELDS)
+    return labels
+
+
 def verify_in_file(item: dict, path: str) -> list[tuple[str, str, str, bool]]:
     """Lee el archivo ahora y compara cada campo escribible con lo que muestra el catálogo."""
     current, _ = read_file(path, item["kind"])
     shown = {**item["file_meta"], **item["edits"]}
-    labels = dict(FIELDS[item["kind"]])
-    return [(labels[key], shown.get(key, ""), current.get(key, ""), shown.get(key, "") == current.get(key, ""))
-            for key, _label in FIELDS[item["kind"]] if key in writable_fields(path, item["kind"])]
+    labels = field_labels(item["kind"])
+    return [(label, shown.get(key, ""), current.get(key, ""), shown.get(key, "") == current.get(key, ""))
+            for key, label in labels.items() if key in writable_fields(path, item["kind"])]
 
 
 def pending_edits(item: dict, path: str) -> dict:
