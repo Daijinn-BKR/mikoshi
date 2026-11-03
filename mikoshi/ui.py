@@ -746,6 +746,14 @@ class MainWindow(QMainWindow):
         if current in getattr(self, "sections", []):
             current.refresh()
 
+    def release_files(self, paths: set[str]) -> None:
+        """Los reproductores de Mikoshi sueltan estos archivos: Windows no deja sustituir uno abierto."""
+        released = self.now_playing.release(paths)
+        for section in self.sections:
+            released = section.release(paths) or released
+        if released:
+            self.status_label.setText("Reproducción detenida para poder escribir en el archivo.")
+
     def status(self, text: str) -> None:
         self.status_label.setText(text)
 
@@ -1519,6 +1527,7 @@ class MainWindow(QMainWindow):
             "¿Continuar?")
         if answer != QMessageBox.StandardButton.Yes:
             return
+        self.release_files({os.path.normcase(full_path(i)) for i in pending})
         worker = WriteWorker(self.catalog.path, [i["id"] for i in pending], self)
         worker.done.connect(self._write_done)
         self._start_worker(worker)

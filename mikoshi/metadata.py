@@ -292,6 +292,11 @@ def write_file(path: str, kind: str, fields: dict) -> None:
             shutil.copy2(path, temp)
             (_write_audio if kind == "audio" else _write_image)(str(temp), fields)
         _replace_with_retry(temp, path)
+    except PermissionError as exc:
+        raise MetadataError(
+            "Windows no deja sustituir el archivo porque otro programa lo tiene abierto (un reproductor, "
+            "el explorador o la sincronización). Ciérralo y vuelve a intentarlo. El original no se ha "
+            f"modificado. ({exc.strerror})") from exc
     except MetadataError:
         raise
     except Exception as exc:

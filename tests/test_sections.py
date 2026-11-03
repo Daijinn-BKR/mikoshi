@@ -427,3 +427,50 @@ def test_reloading_all_view_does_not_cancel_other_covers(window, tmp_path):
     wait_until(lambda: window.thumbs.has(item))
     os.remove(target)
     scanner.scan_root(window.catalog, root["id"])
+
+
+def test_writing_a_video_open_in_favorites_player_releases_it(window, monkeypatch):
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    favorites = section(window, "Videos favoritos")
+    video = favorites.model.items[0]
+    favorites.watch(favorites.model.items, 0)
+    wait_until(lambda: favorites.player.player.duration() > 0)
+    favorites.player.player.pause()
+    window.catalog.save_user_data(video["id"], edits={"genre": "Humor"})
+    window._write_files([video["id"]])
+    wait_until(lambda: window.worker is None, 30000)
+    path = os.path.join(video["root_path"], video["rel_path"])
+    assert metadata.read_file(path, "video")[0]["genre"] == "Humor"
+    assert "Reproducir" in favorites.player.message.text()
+    favorites.player.toggle()
+    wait_until(lambda: favorites.player.player.duration() > 0)
+    favorites._back()
+
+
+def test_writing_the_song_in_the_bar_releases_it(window, monkeypatch):
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    track = section(window, "Música").model.items[0]
+    window.play_items([track], 0)
+    bar = window.now_playing
+    wait_until(lambda: bar.player.duration() > 0)
+    bar.pause()
+    window.catalog.save_user_data(track["id"], edits={"genre": "Jazz"})
+    window._write_files([track["id"]])
+    wait_until(lambda: window.worker is None, 30000)
+    assert metadata.read_file(os.path.join(track["root_path"], track["rel_path"]), "audio")[0]["genre"] == "Jazz"
+    bar.toggle()
+    wait_until(lambda: bar.player.duration() > 0)
+
+
+def test_file_locked_by_other_program_gives_clear_message(tmp_path, monkeypatch):
+    path = tmp_path / "v.mp4"
+    ffmpeg("-f", "lavfi", "-i", "testsrc=duration=1:size=64x36", str(path))
+
+    def locked(src, dst):
+        raise PermissionError(5, "Acceso denegado")
+
+    monkeypatch.setattr(metadata.os, "replace", locked)
+    monkeypatch.setattr(metadata, "REPLACE_WAIT", 0)
+    with pytest.raises(metadata.MetadataError, match="otro programa lo tiene abierto"):
+        metadata.write_file(str(path), "video", {"title": "x"})
+    assert sorted(p.name for p in tmp_path.iterdir() if p.is_file()) == ["v.mp4"]

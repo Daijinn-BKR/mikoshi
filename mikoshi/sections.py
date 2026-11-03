@@ -103,6 +103,10 @@ class Section(QWidget):
     def leave(self) -> None:
         """Al salir de la sección: detener lo que esté sonando dentro de ella."""
 
+    def release(self, paths: set[str]) -> bool:
+        """Suelta los archivos de `paths` que la sección tenga abiertos."""
+        return False
+
     def edit(self, item: dict) -> None:
         self.main.edit_item(item["id"])
         self.refresh()
@@ -1353,6 +1357,9 @@ class FavoritesSection(Section):
         self.player.stop()
         self.pages.setCurrentIndex(0)
         self.refresh()
+
+    def release(self, paths: set[str]) -> bool:
+        return self.player.release(paths)
 
     def leave(self) -> None:
         if self.pages.currentWidget() is self.watch_page:

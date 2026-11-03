@@ -183,8 +183,20 @@ class NowPlayingBar(QWidget):
     def toggle(self) -> None:
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
+        elif self.queue and self.player.source().isEmpty():
+            self._load()
         elif self.queue:
             self.player.play()
+
+    def release(self, paths: set[str]) -> bool:
+        """Suelta la canción actual si es uno de `paths`, para que se pueda escribir en ella."""
+        item = self.current
+        if not item or os.path.normcase(full_path(item)) not in paths:
+            return False
+        self.player.stop()
+        self.player.setSource(QUrl())
+        self.subtitle.setText("Detenida para escribir sus metadatos. Pulsa ▶ para seguir.")
+        return True
 
     def pause(self) -> None:
         self.player.pause()

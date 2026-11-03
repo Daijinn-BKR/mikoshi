@@ -192,7 +192,11 @@ class PlayerWidget(QWidget):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
         elif self.items and self.item["kind"] != "image":
-            self.player.play()
+            if self.player.source().isEmpty():
+                # Se soltó el archivo (por ejemplo, para escribir en él): se vuelve a abrir donde iba.
+                self.load()
+            else:
+                self.player.play()
 
     def _seek(self) -> None:
         self.seeking = False
@@ -230,6 +234,14 @@ class PlayerWidget(QWidget):
             self.open_external(path)
         except OSError as exc:
             self._show_message(f"No se pudo abrir:\n{exc}")
+
+    def release(self, paths: set[str]) -> bool:
+        """Suelta el archivo si es uno de `paths`, para que se pueda escribir en él."""
+        if not self.items or os.path.normcase(full_path(self.item)) not in paths:
+            return False
+        self.stop()
+        self._show_message("Reproducción detenida para escribir los metadatos.\nPulsa «Reproducir» para seguir.")
+        return True
 
     def stop(self) -> None:
         self.save_progress()
