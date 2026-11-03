@@ -181,11 +181,6 @@ class Thumbs(QObject):
             self.pixmaps.popitem(last=False)
         self.updated.emit(item_id)
 
-    def forget_pending(self) -> None:
-        """Descarta lo encargado y no hecho: al cambiar de vista ya no hace falta."""
-        self.pool.clear()
-        self.requested -= {k for k in self.requested if k not in self.pixmaps}
-
     def shutdown(self) -> None:
         self.pool.clear()
         self.pool.waitForDone()

@@ -199,7 +199,6 @@ class ItemsModel(QAbstractTableModel):
         return sorted(items, key=key, reverse=self.sort_order == Qt.SortOrder.DescendingOrder)
 
     def set_items(self, items: list[dict]) -> None:
-        self.thumbs.forget_pending()
         self.beginResetModel()
         self.items = self._sorted(items)
         self.endResetModel()

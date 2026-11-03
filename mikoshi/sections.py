@@ -63,6 +63,30 @@ def chip(text: str) -> QPushButton:
     return button
 
 
+class IconBinder:
+    """Pone la miniatura en las filas de una lista y la renueva cuando termina de crearse.
+
+    Sin esto, la fila se queda para siempre con el recuadro de color provisional.
+    """
+
+    def __init__(self, thumbs):
+        self.thumbs = thumbs
+        self.entries: dict[int, list] = defaultdict(list)
+        thumbs.updated.connect(self._updated)
+
+    def clear(self, owner) -> None:
+        for item_id in list(self.entries):
+            self.entries[item_id] = [e for e in self.entries[item_id] if e[0] is not owner]
+
+    def bind(self, owner, entry, item: dict, make=QIcon) -> None:
+        entry.setIcon(make(self.thumbs.get(item)))
+        self.entries[item["id"]].append((owner, entry, item, make))
+
+    def _updated(self, item_id: int) -> None:
+        for _owner, entry, item, make in self.entries.get(item_id, []):
+            entry.setIcon(make(self.thumbs.get(item)))
+
+
 class Section(QWidget):
     title = ""
 
@@ -71,6 +95,7 @@ class Section(QWidget):
         self.main = main
         self.catalog = main.catalog
         self.thumbs = main.thumbs
+        self.icons = IconBinder(self.thumbs)
 
     def refresh(self) -> None:
         raise NotImplementedError
@@ -225,6 +250,7 @@ class MusicSection(Section):
         for item in self.tracks:
             groups[self._group_value(item, key)].append(item)
         self.browser.blockSignals(True)
+        self.icons.clear(self.browser)
         self.browser.clear()
         everything = QListWidgetItem(f"Todo ({len(self.tracks)})")
         everything.setData(Qt.ItemDataRole.UserRole, None)
@@ -239,7 +265,7 @@ class MusicSection(Section):
             entry = QListWidgetItem(f"{label}  ({len(members)})" if key != "album" else label)
             entry.setData(Qt.ItemDataRole.UserRole, name)
             if key == "album":
-                entry.setIcon(QIcon(self.thumbs.get(members[0])))
+                self.icons.bind(self.browser, entry, members[0])
             self.browser.addItem(entry)
             if name == current:
                 self.browser.setCurrentItem(entry)
@@ -656,9 +682,11 @@ class GamesSection(Section):
         else:
             games.sort(key=lambda g: display_title(g).casefold())
         self.grid_model.set_items(games)
+        self.icons.clear(self.listing)
         self.listing.clear()
         for game in sorted(games, key=lambda g: display_title(g).casefold()):
-            entry = QListWidgetItem(QIcon(self.thumbs.get(game)), display_title(game))
+            entry = QListWidgetItem(display_title(game))
+            self.icons.bind(self.listing, entry, game)
             entry.setData(Qt.ItemDataRole.UserRole, game)
             self.listing.addItem(entry)
         self.empty.setVisible(not self.games)
@@ -1056,6 +1084,7 @@ class CinemaSection(Section):
         return next((e for e in self.series.get(self.current_series, []) if not self._watched(e)), None)
 
     def _fill_episodes(self) -> None:
+        self.icons.clear(self.episodes)
         self.episodes.clear()
         for episode in self.season_episodes():
             _season, number_, _title = self.episode_key(episode)
@@ -1064,7 +1093,8 @@ class CinemaSection(Section):
                 f"Visto hasta {clock(stats['position_ms'] // 1000)}" if stats.get("position_ms") else "")
             label = f"{number_ if number_ < 10 ** 6 else '·'}. {display_title(episode)}\n" \
                     f"{' · '.join(p for p in (clock(seconds(episode)), status) if p)}"
-            entry = QListWidgetItem(QIcon(cover_pixmap(self.thumbs.get(episode), 176, 99)), label)
+            entry = QListWidgetItem(label)
+            self.icons.bind(self.episodes, entry, episode, lambda p: QIcon(cover_pixmap(p, 176, 99)))
             entry.setData(Qt.ItemDataRole.UserRole, episode)
             self.episodes.addItem(entry)
 
@@ -1306,10 +1336,11 @@ class FavoritesSection(Section):
         self.watch_meta.setText(" · ".join(p for p in (f"{plays} reproducciones", ago(item["added_at"]),
                                                        clock(seconds(item)), human_size(item["size"])) if p))
         self.watch_description.setText(meta.get("description", ""))
+        self.icons.clear(self.up_next)
         self.up_next.clear()
         for offset, video in enumerate(self.player.items[self.player.index + 1:self.player.index + 30], 1):
-            entry = QListWidgetItem(QIcon(cover_pixmap(self.thumbs.get(video), 168, 94)),
-                                    f"{display_title(video)}\n{clock(seconds(video))}")
+            entry = QListWidgetItem(f"{display_title(video)}\n{clock(seconds(video))}")
+            self.icons.bind(self.up_next, entry, video, lambda p: QIcon(cover_pixmap(p, 168, 94)))
             entry.setData(Qt.ItemDataRole.UserRole, offset)
             self.up_next.addItem(entry)
 

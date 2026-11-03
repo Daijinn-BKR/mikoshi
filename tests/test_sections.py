@@ -122,6 +122,44 @@ def test_music_browse_by_album_filters(window):
     assert "Alfa" in entry.text()
 
 
+def test_album_list_replaces_placeholder_when_cover_arrives(window, tmp_path):
+    cover = tmp_path / "portada.jpg"
+    Image.new("RGB", (64, 64), "red").save(cover)
+    track = tmp_path / "con_portada.mp3"
+    ffmpeg("-f", "lavfi", "-i", "sine=duration=1", "-i", str(cover), "-map", "0", "-map", "1", "-c:v", "mjpeg",
+           "-id3v2_version", "3", "-disposition:v", "attached_pic", str(track))
+    root = next(r for r in window.catalog.roots() if r["path"].endswith("musica"))
+    target = os.path.join(root["path"], "con_portada.mp3")
+    __import__("shutil").copy(track, target)
+    metadata.write_file(target, "audio", {"album": "Rojo", "artist": "Nadie", "title": "Con portada"})
+    scanner.scan_root(window.catalog, root["id"])
+    window.thumbs.pixmaps.clear()
+    window.thumbs.requested.clear()
+    music = section(window, "Música")
+    music.browse_mode.setCurrentIndex(1)
+    entry = next(music.browser.item(i) for i in range(music.browser.count())
+                 if music.browser.item(i).text().startswith("Rojo"))
+    placeholder_key = window.thumbs.placeholders["audio"].cacheKey()
+    item = next(t for t in music.tracks if t["rel_path"] == "con_portada.mp3")
+    wait_until(lambda: window.thumbs.has(item))
+    pixmap = entry.icon().pixmap(40, 40).toImage()
+    red = pixmap.pixelColor(20, 20)
+    assert red.red() > 200 and red.green() < 60, (red.name(), placeholder_key)
+    os.remove(target)
+    scanner.scan_root(window.catalog, root["id"])
+
+
+def test_icon_binder_forgets_cleared_lists(window):
+    music = section(window, "Música")
+    music.browse_mode.setCurrentIndex(1)
+    music.browse_mode.setCurrentIndex(0)
+    music.browse_mode.setCurrentIndex(1)
+    bound = sum(1 for entries in music.icons.entries.values() for e in entries if e[0] is music.browser)
+    assert bound == music.browser.count() - 1
+    for item_id in list(music.icons.entries):
+        music.icons._updated(item_id)
+
+
 def test_music_plays_in_bar_with_queue_controls(window):
     music = section(window, "Música")
     music.sort.setCurrentText("Álbum")
@@ -366,3 +404,26 @@ def test_rescan_keeps_activity(window):
     window.catalog.record_play(track["id"])
     scanner.scan_root(window.catalog, track["root_id"])
     assert window.catalog.activity()[track["id"]]["play_count"] == 1
+
+
+
+def test_reloading_all_view_does_not_cancel_other_covers(window, tmp_path):
+    cover = tmp_path / "azul.jpg"
+    Image.new("RGB", (64, 64), "blue").save(cover)
+    root = next(r for r in window.catalog.roots() if r["path"].endswith("musica"))
+    target = os.path.join(root["path"], "azul.mp3")
+    ffmpeg("-f", "lavfi", "-i", "sine=duration=1", "-i", str(cover), "-map", "0", "-map", "1", "-c:v", "mjpeg",
+           "-id3v2_version", "3", "-disposition:v", "attached_pic", target)
+    metadata.write_file(target, "audio", {"album": "Azul", "title": "Azul"})
+    scanner.scan_root(window.catalog, root["id"])
+    window.thumbs.pixmaps.clear()
+    window.thumbs.requested.clear()
+    music = section(window, "Música")
+    music.browse_mode.setCurrentIndex(1)
+    # Antes, recargar la vista «Todo» cancelaba las carátulas pedidas por otras listas.
+    for _ in range(5):
+        window.reload()
+    item = next(t for t in music.tracks if t["rel_path"] == "azul.mp3")
+    wait_until(lambda: window.thumbs.has(item))
+    os.remove(target)
+    scanner.scan_root(window.catalog, root["id"])
