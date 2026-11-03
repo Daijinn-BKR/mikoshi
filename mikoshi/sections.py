@@ -6,6 +6,7 @@ reproducir, el menú de un elemento y las tareas largas.
 from __future__ import annotations
 
 import os
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -548,7 +549,12 @@ class BooksSection(Section):
             lines.append(f"Etiquetas: {item['tags']}")
         lines.append(f"{Path(item['rel_path']).suffix.lstrip('.').upper()} · {human_size(item['size'])}")
         self.book_meta.setText("\n".join(line for line in lines if line))
-        self.description.setPlainText(meta.get("description", "") or "Sin descripción.")
+        description = meta.get("description", "") or "Sin descripción."
+        if re.search(r"<[a-zA-Z/][^>]*>", description):
+            # Los EPUB guardan la sinopsis en HTML: se muestra con formato, sin enlaces ni imágenes externas.
+            self.description.setHtml(description)
+        else:
+            self.description.setPlainText(description)
 
     def _read(self) -> None:
         if not self.current:

@@ -474,3 +474,12 @@ def test_file_locked_by_other_program_gives_clear_message(tmp_path, monkeypatch)
     with pytest.raises(metadata.MetadataError, match="otro programa lo tiene abierto"):
         metadata.write_file(str(path), "video", {"title": "x"})
     assert sorted(p.name for p in tmp_path.iterdir() if p.is_file()) == ["v.mp4"]
+
+
+def test_book_html_description_is_rendered_not_shown_raw(window):
+    books = section(window, "Libros")
+    item = books.books[0]
+    window.catalog.save_user_data(item["id"], edits={"description": "<p>Primera <cite>edición</cite></p>"})
+    books.refresh()
+    books.table.selectRow(0)
+    assert books.description.toPlainText().strip() == "Primera edición"

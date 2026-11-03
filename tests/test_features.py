@@ -291,3 +291,81 @@ def test_http_key_error_message_does_not_expose_key(monkeypatch):
     with pytest.raises(online.OnlineError) as info:
         online._get("https://x/", {"api_key": "SECRETA"})
     assert "SECRETA" not in str(info.value)
+
+
+def make_epub(path, opf_meta, manifest, files):
+    import zipfile
+
+    with zipfile.ZipFile(path, "w") as book:
+        book.writestr("mimetype", "application/epub+zip")
+        book.writestr("META-INF/container.xml",
+                      '<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles>'
+                      '<rootfile full-path="OEBPS/content.opf"/></rootfiles></container>')
+        book.writestr("OEBPS/content.opf",
+                      '<package xmlns="http://www.idpf.org/2007/opf"><metadata>' + opf_meta +
+                      '<dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">Libro</dc:title></metadata>'
+                      '<manifest>' + manifest + '</manifest></package>')
+        for name, data in files.items():
+            book.writestr(name, data)
+
+
+def jpeg_bytes(color):
+    import io
+
+    out = io.BytesIO()
+    Image.new("RGB", (30, 45), color).save(out, "JPEG")
+    return out.getvalue()
+
+
+@pytest.mark.parametrize("meta,manifest,files,color", [
+    # Como los EPUB de ePubLibre: <meta name="cover"> apunta al id de la imagen, en otra carpeta.
+    ('<meta name="cover" content="img1"/>', '<item id="img1" href="../Images/portada%20a.jpg"/>',
+     {"Images/portada a.jpg": "red", "Images/otra.jpg": "blue"}, "red"),
+    ('', '<item id="c" href="img/c.jpg" properties="cover-image"/>', {"OEBPS/img/c.jpg": "green"}, "green"),
+    ('', '', {"OEBPS/a.jpg": "blue", "OEBPS/Cover.jpeg": "red"}, "red"),
+])
+def test_epub_cover_extraction(tmp_path, meta, manifest, files, color):
+    from mikoshi import thumbnails
+
+    path = tmp_path / "libro.epub"
+    make_epub(path, meta, manifest, {name: jpeg_bytes(c) for name, c in files.items()})
+    data = thumbnails._book_cover(str(path))
+    pixel = Image.open(__import__("io").BytesIO(data)).convert("RGB").getpixel((10, 10))
+    expected = {"red": 0, "green": 1, "blue": 2}[color]
+    assert max(range(3), key=lambda channel: pixel[channel]) == expected
+
+
+def test_book_without_cover_and_broken_book(tmp_path):
+    from mikoshi import thumbnails
+
+    path = tmp_path / "sin.epub"
+    make_epub(path, "", "", {})
+    assert thumbnails._book_cover(str(path)) is None
+    broken = tmp_path / "roto.epub"
+    broken.write_bytes(b"no es zip")
+    with pytest.raises(Exception):
+        thumbnails._book_cover(str(broken))
+
+
+def test_comic_and_pdf_covers(tmp_path):
+    import zipfile
+    from mikoshi import thumbnails
+
+    comic = tmp_path / "c.cbz"
+    with zipfile.ZipFile(comic, "w") as z:
+        z.writestr("002.jpg", jpeg_bytes("blue"))
+        z.writestr("001.jpg", jpeg_bytes("red"))
+    assert Image.open(__import__("io").BytesIO(thumbnails._book_cover(str(comic)))).getpixel((5, 5))[0] > 200
+    pdf = tmp_path / "p.pdf"
+    Image.new("RGB", (60, 90), "green").save(pdf)
+    assert thumbnails._book_cover(str(pdf))
+
+
+def test_document_thumbnail_is_created(catalog, lib):
+    from mikoshi import thumbnails
+
+    make_epub(lib / "libro.epub", '<meta name="cover" content="x"/>', '<item id="x" href="c.jpg"/>',
+              {"OEBPS/c.jpg": jpeg_bytes("red")})
+    scan(catalog, lib)
+    item = catalog.query_items(kind="document")[0]
+    assert thumbnails.thumbnail_for(item)
