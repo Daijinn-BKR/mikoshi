@@ -441,7 +441,7 @@ def test_writing_a_video_open_in_favorites_player_releases_it(window, monkeypatc
     wait_until(lambda: window.worker is None, 30000)
     path = os.path.join(video["root_path"], video["rel_path"])
     assert metadata.read_file(path, "video")[0]["genre"] == "Humor"
-    assert "Reproducir" in favorites.player.message.text()
+    assert "Pulsa ▶ para seguir" in favorites.player.message.text()
     favorites.player.toggle()
     wait_until(lambda: favorites.player.player.duration() > 0)
     favorites._back()
@@ -625,7 +625,7 @@ def test_fullscreen_fills_the_window_and_restores_everything(window):
     assert window.windowState() & Qt.WindowState.WindowFullScreen
     assert not any(w.isVisible() for w in others)
     assert player.video.isVisible() and player.position.isVisible()
-    assert player.fullscreen_button.text() == "Salir de pantalla completa"
+    assert player.fullscreen_button.toolTip().startswith("Salir de pantalla completa")
     player.toggle_fullscreen()
     assert not player.immersive and all(w.isVisible() for w in others)
     assert not window.windowState() & Qt.WindowState.WindowFullScreen
@@ -719,4 +719,29 @@ def test_video_frames_are_drawn_in_layered_view(window):
     player = favorites.player
     wait_until(lambda: not player.video.item.nativeSize().isEmpty())
     assert player.video.item.size().width() == player.video.viewport().width()
+    favorites._back()
+
+
+
+def test_player_uses_icons_and_has_no_open_outside_button(window):
+    favorites = favorites_with_root(window)
+    favorites.watch(favorites.model.items, 0)
+    player = favorites.player
+    from PySide6.QtWidgets import QPushButton as Button
+
+    texts = [b.text() for b in player.controls.findChildren(Button)]
+    assert texts == ["", "", "", ""], texts
+    assert not any("Abrir fuera" in b.toolTip() for b in player.controls.findChildren(Button))
+    key = lambda name: player.icons[name].pixmap(28, 28).toImage()
+    assert len({key(n).cacheKey() for n in player.icons}) == len(player.icons)
+    assert key("play") != key("pause") and key("fullscreen") != key("exit_fullscreen")
+    wait_until(lambda: player.player.playbackState() == player.player.PlaybackState.PlayingState)
+    assert player.play_button.icon().pixmap(28, 28).toImage() == key("pause")
+    player.toggle()
+    assert player.play_button.icon().pixmap(28, 28).toImage() == key("play")
+    assert player.play_button.toolTip().startswith("Reproducir")
+    assert player.fullscreen_button.icon().pixmap(28, 28).toImage() == key("fullscreen")
+    player.toggle_fullscreen()
+    assert player.fullscreen_button.icon().pixmap(28, 28).toImage() == key("exit_fullscreen")
+    player.toggle_fullscreen()
     favorites._back()

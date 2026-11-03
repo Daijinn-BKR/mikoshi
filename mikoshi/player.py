@@ -4,8 +4,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QSizeF, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QBrush, QColor, QCursor, QImageReader, QKeySequence, QPixmap, QShortcut
+from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, QSizeF, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QBrush, QColor, QCursor, QIcon, QImageReader, QKeySequence, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
+    QShortcut,
+)
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from PySide6.QtWidgets import (
@@ -26,6 +29,50 @@ OVERLAY_STYLE = """
 #overlay QPushButton:disabled { color: rgba(255,255,255,80); }
 #overlay QLabel { color: white; background: transparent; }
 """
+
+
+def _draw_icon(name: str, color: QColor) -> QPixmap:
+    """Iconos del reproductor con las formas de YouTube, dibujados en una cuadrícula de 48 × 48."""
+    pixmap = QPixmap(48, 48)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(color)
+    triangle = lambda *points: painter.drawPolygon(QPolygonF([QPointF(x, y) for x, y in points]))
+    if name == "play":
+        triangle((15, 10), (15, 38), (38, 24))
+    elif name == "pause":
+        painter.drawRect(QRectF(13, 10, 8, 28))
+        painter.drawRect(QRectF(27, 10, 8, 28))
+    elif name == "next":
+        triangle((12, 12), (12, 36), (31, 24))
+        painter.drawRect(QRectF(32, 12, 4, 24))
+    elif name == "previous":
+        triangle((36, 12), (36, 36), (17, 24))
+        painter.drawRect(QRectF(12, 12, 4, 24))
+    else:
+        # Esquinas hacia fuera para entrar en pantalla completa; hacia dentro para salir.
+        pen = QPen(color, 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.SquareCap, Qt.PenJoinStyle.MiterJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        outward = [((10, 19), (10, 10), (19, 10)), ((29, 10), (38, 10), (38, 19)),
+                   ((38, 29), (38, 38), (29, 38)), ((19, 38), (10, 38), (10, 29))]
+        inward = [((10, 18), (18, 18), (18, 10)), ((30, 10), (30, 18), (38, 18)),
+                  ((38, 30), (30, 30), (30, 38)), ((18, 38), (18, 30), (10, 30))]
+        for a, b, c in outward if name == "fullscreen" else inward:
+            path = QPainterPath(QPointF(*a))
+            path.lineTo(QPointF(*b))
+            path.lineTo(QPointF(*c))
+            painter.drawPath(path)
+    painter.end()
+    return pixmap
+
+
+def player_icon(name: str) -> QIcon:
+    icon = QIcon(_draw_icon(name, QColor("white")))
+    icon.addPixmap(_draw_icon(name, QColor(255, 255, 255, 80)), QIcon.Mode.Disabled)
+    return icon
 
 
 def format_time(ms: int) -> str:
@@ -166,12 +213,17 @@ class PlayerWidget(QWidget):
         self.player.setAudioOutput(self.audio)
         self.player.setVideoOutput(self.video.item)
 
-        self.previous_button = QPushButton("◀◀")
-        self.play_button = QPushButton("Pausa")
-        self.next_button = QPushButton("▶▶")
-        self.external_button = QPushButton("Abrir fuera…")
-        self.fullscreen_button = QPushButton("Pantalla completa")
-        self.fullscreen_button.setToolTip("También con doble clic o la tecla F. Esc para salir.")
+        self.icons = {name: player_icon(name)
+                      for name in ("play", "pause", "previous", "next", "fullscreen", "exit_fullscreen")}
+        self.previous_button = QPushButton(toolTip="Vídeo anterior")
+        self.play_button = QPushButton(toolTip="Pausa (Espacio)")
+        self.next_button = QPushButton(toolTip="Siguiente vídeo")
+        self.fullscreen_button = QPushButton(toolTip="Pantalla completa (F o doble clic)")
+        for button, icon in ((self.previous_button, "previous"), (self.play_button, "pause"),
+                             (self.next_button, "next"), (self.fullscreen_button, "fullscreen")):
+            button.setIcon(self.icons[icon])
+            button.setIconSize(QSize(28, 28))
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.position = SeekSlider()
         self.time_label = QLabel("0:00 / 0:00")
         self.volume = QSlider(Qt.Orientation.Horizontal)
@@ -194,7 +246,6 @@ class PlayerWidget(QWidget):
         buttons.addWidget(QLabel("Vol."))
         buttons.addWidget(self.volume)
         buttons.addWidget(self.fullscreen_button)
-        buttons.addWidget(self.external_button)
         overlay = QVBoxLayout(self.controls)
         overlay.setContentsMargins(12, 24, 12, 6)
         overlay.setSpacing(2)
@@ -214,7 +265,6 @@ class PlayerWidget(QWidget):
         self.previous_button.clicked.connect(lambda: self.go(-1))
         self.next_button.clicked.connect(lambda: self.go(1))
         self.play_button.clicked.connect(self.toggle)
-        self.external_button.clicked.connect(self._open_outside)
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
         self.volume.valueChanged.connect(lambda value: self.audio.setVolume(value / 100))
         self.position.sliderPressed.connect(lambda: setattr(self, "seeking", True))
@@ -400,7 +450,8 @@ class PlayerWidget(QWidget):
             node = parent
         self.saved_window_state = window.windowState()
         self.immersive = True
-        self.fullscreen_button.setText("Salir de pantalla completa")
+        self.fullscreen_button.setIcon(self.icons["exit_fullscreen"])
+        self.fullscreen_button.setToolTip("Salir de pantalla completa (Esc)")
         window.showFullScreen()
         self.video.setFocus()
 
@@ -412,7 +463,8 @@ class PlayerWidget(QWidget):
             layout.setContentsMargins(margins)
         self.hidden_for_fullscreen, self.saved_margins = [], []
         self.immersive = False
-        self.fullscreen_button.setText("Pantalla completa")
+        self.fullscreen_button.setIcon(self.icons["fullscreen"])
+        self.fullscreen_button.setToolTip("Pantalla completa (F o doble clic)")
         window.setWindowState(self.saved_window_state or Qt.WindowState.WindowNoState)
         window.show()
 
@@ -429,7 +481,8 @@ class PlayerWidget(QWidget):
 
     def _state_changed(self, state) -> None:
         playing = state == QMediaPlayer.PlaybackState.PlayingState
-        self.play_button.setText("Pausa" if playing else "Reproducir")
+        self.play_button.setIcon(self.icons["pause" if playing else "play"])
+        self.play_button.setToolTip("Pausa (Espacio)" if playing else "Reproducir (Espacio)")
         # En pausa los controles se quedan a la vista; al reproducir, se ocultan tras un rato.
         self.poke()
         if not playing:
@@ -450,22 +503,15 @@ class PlayerWidget(QWidget):
 
     def _error(self, _error, text: str) -> None:
         self.loaded_item = None
-        self._show_message(f"Este archivo no se puede reproducir aquí.\nUsa «Abrir fuera…».\n\n{text}")
-
-    def _open_outside(self) -> None:
-        path = full_path(self.item)
-        self.player.pause()
-        try:
-            self.open_external(path)
-        except OSError as exc:
-            self._show_message(f"No se pudo abrir:\n{exc}")
+        self._show_message(f"Este archivo no se puede reproducir aquí.\n"
+                           f"Ábrelo con otro programa desde «Ver en carpeta».\n\n{text}")
 
     def release(self, paths: set[str]) -> bool:
         """Suelta el archivo si es uno de `paths`, para que se pueda escribir en él."""
         if not self.items or os.path.normcase(full_path(self.item)) not in paths:
             return False
         self.stop()
-        self._show_message("Reproducción detenida para escribir los metadatos.\nPulsa «Reproducir» para seguir.")
+        self._show_message("Reproducción detenida para escribir los metadatos.\nPulsa ▶ para seguir.")
         return True
 
     def stop(self) -> None:

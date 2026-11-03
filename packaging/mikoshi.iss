@@ -1,5 +1,5 @@
 ; Instalador de Mikoshi. Se compila con build.ps1 si Inno Setup 6 está instalado.
-#define AppVersion "0.5.2"
+#define AppVersion "0.5.3"
 
 [Setup]
 AppId={{7C1F0E52-3B8A-4E6D-9A41-5D2B7E90C3A1}
