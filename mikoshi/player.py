@@ -21,6 +21,23 @@ from .db import display_title, full_path
 PLAYABLE = {"video", "audio", "image"}
 HIDE_CONTROLS_AFTER_MS = 2500
 
+# Teclas que no deben mostrar los controles: volumen, multimedia y brillo del teclado del portátil
+# (Fn + F3/F5/F6 y similares) y los modificadores pulsados solos.
+SILENT_KEYS = {
+    Qt.Key.Key_VolumeUp, Qt.Key.Key_VolumeDown, Qt.Key.Key_VolumeMute, Qt.Key.Key_MicMute,
+    Qt.Key.Key_MediaPlay, Qt.Key.Key_MediaPause, Qt.Key.Key_MediaTogglePlayPause, Qt.Key.Key_MediaStop,
+    Qt.Key.Key_MediaNext, Qt.Key.Key_MediaPrevious, Qt.Key.Key_MonBrightnessUp, Qt.Key.Key_MonBrightnessDown,
+    Qt.Key.Key_KeyboardBrightnessUp, Qt.Key.Key_KeyboardBrightnessDown, Qt.Key.Key_KeyboardLightOnOff,
+    Qt.Key.Key_Shift, Qt.Key.Key_Control, Qt.Key.Key_Alt, Qt.Key.Key_Meta, Qt.Key.Key_AltGr,
+    Qt.Key.Key_unknown,
+}
+# Los mismos, según el código de Windows, por si el teclado no los traduce a una tecla de Qt.
+SILENT_WINDOWS_KEYS = set(range(0xAD, 0xB8))
+
+
+def is_silent_key(event) -> bool:
+    return event.key() in SILENT_KEYS or event.nativeVirtualKey() in SILENT_WINDOWS_KEYS
+
 # Controles sobre el vídeo, como en YouTube: transparentes, con un degradado oscuro para leerse.
 OVERLAY_STYLE = """
 #overlay { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(0,0,0,0), stop:1 rgba(0,0,0,200)); }
@@ -301,7 +318,7 @@ class PlayerWidget(QWidget):
         kind = event.type()
         if watched is self.stage_box and kind == QEvent.Type.Resize:
             self._place_controls()
-        elif kind == QEvent.Type.KeyPress and self.isVisible():
+        elif kind == QEvent.Type.KeyPress and self.isVisible() and not is_silent_key(event):
             self.poke()
         elif kind == QEvent.Type.MouseMove and self.isVisible() and self._mouse_over_video():
             self.poke()

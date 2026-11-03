@@ -745,3 +745,27 @@ def test_player_uses_icons_and_has_no_open_outside_button(window):
     assert player.fullscreen_button.icon().pixmap(28, 28).toImage() == key("exit_fullscreen")
     player.toggle_fullscreen()
     favorites._back()
+
+
+def test_volume_and_media_keys_do_not_show_controls(window):
+    from PySide6.QtGui import QKeyEvent
+    from PySide6.QtCore import QEvent as Event
+
+    favorites = favorites_with_root(window)
+    favorites.watch(favorites.model.items, 0)
+    player = favorites.player
+    player.hide_timer.setInterval(100)
+    wait_until(lambda: player.player.playbackState() == player.player.PlaybackState.PlayingState)
+    player.poke()
+    wait_until(lambda: not player.controls.isVisible(), 3000)
+    silent = [(Qt.Key.Key_VolumeUp, 0xAF), (Qt.Key.Key_VolumeDown, 0xAE), (Qt.Key.Key_VolumeMute, 0xAD),
+              (Qt.Key.Key_MediaTogglePlayPause, 0xB3), (Qt.Key.Key_unknown, 0xAF), (Qt.Key.Key_Shift, 0x10),
+              (Qt.Key.Key_MonBrightnessUp, 0)]
+    for key, native in silent:
+        event = QKeyEvent(Event.Type.KeyPress, key, Qt.KeyboardModifier.NoModifier, 0, native, 0)
+        QApplication.sendEvent(player.video, event)
+        assert not player.controls.isVisible(), key
+    event = QKeyEvent(Event.Type.KeyPress, Qt.Key.Key_K, Qt.KeyboardModifier.NoModifier, 0, 0x4B, 0, "k")
+    QApplication.sendEvent(player.video, event)
+    assert player.controls.isVisible()
+    favorites._back()
