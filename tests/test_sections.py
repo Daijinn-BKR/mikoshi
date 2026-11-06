@@ -1,5 +1,6 @@
 import os
 import subprocess
+from pathlib import Path
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
@@ -769,3 +770,53 @@ def test_volume_and_media_keys_do_not_show_controls(window):
     QApplication.sendEvent(player.video, event)
     assert player.controls.isVisible()
     favorites._back()
+
+
+def test_edit_channel_profile_shows_on_channel_page(window, tmp_path, monkeypatch):
+    from PySide6.QtCore import QDate
+    from PySide6.QtWidgets import QDialog
+    from mikoshi.db import covers_dir
+
+    favorites = favorites_with_root(window)
+    favorites.show_channel("Sin autor")
+    edit = next(b for b in favorites.channel_page.findChildren(QPushButton) if b.text() == "Editar canal…")
+    page_width = favorites.channel_page.width()
+    assert edit.mapTo(favorites.channel_page, edit.rect().topRight()).x() > page_width * 0.8
+    photo = tmp_path / "perfil.png"
+    Image.new("RGB", (80, 80), "red").save(photo)
+
+    def fill(dialog):
+        if isinstance(dialog, dialogs.ChannelDialog):
+            dialog._set_avatar(str(photo))
+            dialog.created_known.setChecked(True)
+            dialog.created.setDate(QDate(2014, 5, 2))
+            dialog.country.setCurrentText("Japón")
+            dialog.total.setValue(340)
+            dialog._save()
+            return QDialog.DialogCode.Accepted
+        return 0
+
+    monkeypatch.setattr(dialogs.ChannelDialog, "exec", fill)
+    edit.click()
+    info = window.catalog.channel("Sin autor")
+    assert (info["country"], info["total_videos"], info["created"]) == ("Japón", 340, "2014-05-02")
+    assert Path(info["avatar"]).parent == covers_dir() and Path(info["avatar"]).exists()
+    assert "340 en total" in favorites.channel_meta.text()
+    assert "Japón" in favorites.channel_details.text() and "02/05/2014" in favorites.channel_details.text()
+    center = favorites.channel_avatar.pixmap().toImage().pixelColor(36, 36)
+    assert center.red() > 200 and center.green() < 60
+    favorites.show_channels()
+    cover = favorites.channels_model.cover_of(favorites.channels_model.items[0])
+    assert cover["cover"] == info["avatar"] and cover["id"] == favorites._channel_cover(
+        favorites.channels_model.items[0])["id"]
+    assert -2**31 <= cover["id"] < 0
+    wait_until(lambda: window.thumbs.has(cover))
+    window.catalog.save_channel("Sin autor", avatar="", country="", total_videos=0, created="")
+
+
+def test_channel_dialog_unknown_values_are_saved_empty(window):
+    dialog = dialogs.ChannelDialog(window.catalog, "Nadie", 3)
+    assert not dialog.created.isEnabled() and dialog.total.text() == "Desconocida"
+    dialog._save()
+    assert window.catalog.channel("Nadie") == {"name": "Nadie", "avatar": "", "created": "", "country": "",
+                                               "total_videos": 0}

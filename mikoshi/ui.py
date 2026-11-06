@@ -8,7 +8,9 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QRect, QSize, Qt, QThread, Signal
+from PySide6.QtCore import (
+    QAbstractTableModel, QLibraryInfo, QModelIndex, QRect, QSize, Qt, QThread, QTranslator, Signal,
+)
 from PySide6.QtGui import (
     QAction, QColor, QIcon, QImage, QIntValidator, QKeySequence, QPainter, QPixmap,
 )
@@ -1670,9 +1672,21 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def install_spanish(app) -> None:
+    """Traduce al español los textos propios de Qt: botones Guardar, Cancelar, Sí, No…"""
+    folder = QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)
+    app.translators = []
+    for name in ("qtbase_es", "qt_es"):
+        translator = QTranslator(app)
+        if translator.load(name, folder):
+            app.installTranslator(translator)
+            app.translators.append(translator)
+
+
 def run() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Mikoshi")
+    install_spanish(app)
     apply_theme(app)
     window = MainWindow()
     window.show()

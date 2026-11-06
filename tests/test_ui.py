@@ -589,3 +589,16 @@ def test_short_video_gets_thumbnail(window):
     scan(window)
     select(window, "corto")
     wait_until(lambda: any(k.startswith(str(window.detail.item["id"]) + "|") for k in window.model.pixmaps))
+
+
+def test_spanish_translation_for_standard_buttons(app):
+    from PySide6.QtWidgets import QDialogButtonBox
+    from mikoshi.ui import install_spanish
+
+    install_spanish(app)
+    assert app.translators, "no se encontró la traducción de Qt al español"
+    box = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+    texts = {b.text().replace("&", "") for b in box.buttons()}
+    assert texts == {"Guardar", "Cancelar"}, texts
+    for translator in app.translators:
+        app.removeTranslator(translator)

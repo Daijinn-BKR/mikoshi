@@ -369,3 +369,14 @@ def test_document_thumbnail_is_created(catalog, lib):
     scan(catalog, lib)
     item = catalog.query_items(kind="document")[0]
     assert thumbnails.thumbnail_for(item)
+
+
+def test_channel_profile_round_trip(catalog):
+    assert catalog.channel("Canal") == {"name": "Canal", "avatar": "", "created": "", "country": "",
+                                        "total_videos": 0}
+    catalog.save_channel("Canal", country="Chile", total_videos=340)
+    catalog.save_channel("canal", created="2014-05-02")
+    info = catalog.channel("CANAL")
+    assert (info["country"], info["total_videos"], info["created"]) == ("Chile", 340, "2014-05-02")
+    with pytest.raises(ValueError):
+        catalog.save_channel("Canal", suscriptores=10)

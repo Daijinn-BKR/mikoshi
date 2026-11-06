@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import os
 import re
+import zlib
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSize, Qt
+from PySide6.QtCore import QAbstractTableModel, QDate, QModelIndex, QSize, Qt
 from PySide6.QtGui import QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
@@ -1240,7 +1241,7 @@ class FavoritesSection(Section):
         top.addStretch()
         self.channels_model = CardModel(self.thumbs, title=lambda c: c["name"],
                                         subtitle=lambda c: f"{len(c['videos'])} videos")
-        self.channels_model.cover_of = lambda c: c["videos"][0]
+        self.channels_model.cover_of = self._channel_cover
         self.channels_grid = card_view(self.channels_model, 180, SQUARE)
         self.channels_grid.clicked.connect(
             lambda index: self.show_channel(self.channels_model.items[index.row()]["name"]))
@@ -1254,13 +1255,26 @@ class FavoritesSection(Section):
     def _build_channel_page(self) -> QWidget:
         back = QPushButton("← Canales")
         back.clicked.connect(self.show_channels)
+        self.channel_avatar = QLabel()
+        self.channel_avatar.setFixedSize(72, 72)
         self.channel_title = heading("")
         self.channel_meta = muted()
+        self.channel_meta.setWordWrap(False)
+        self.channel_details = muted()
+        edit = QPushButton("Editar canal…")
+        edit.clicked.connect(self._edit_channel)
+        texts = QVBoxLayout()
+        texts.setSpacing(2)
+        texts.addWidget(self.channel_title)
+        texts.addWidget(self.channel_meta)
+        texts.addWidget(self.channel_details)
         top = QHBoxLayout()
-        top.addWidget(back)
-        top.addWidget(self.channel_title)
-        top.addWidget(self.channel_meta)
+        top.addWidget(back, 0, Qt.AlignmentFlag.AlignTop)
+        top.addSpacing(8)
+        top.addWidget(self.channel_avatar)
+        top.addLayout(texts)
         top.addStretch()
+        top.addWidget(edit, 0, Qt.AlignmentFlag.AlignTop)
         self.channel_model = self._video_model()
         self.channel_grid = card_view(self.channel_model, 280, WIDE)
         self._connect_video_grid(self.channel_grid, self.channel_model)
@@ -1283,11 +1297,44 @@ class FavoritesSection(Section):
             self.player.stop()
         self.current_channel = name
         videos = self.channels().get(name, [])
+        info = self.catalog.channel(name)
         self.channel_title.setText(name)
         total = sum(seconds(v) for v in videos)
-        self.channel_meta.setText(f"{len(videos)} videos · {clock(total) or '0:00'}")
+        counts = f"{len(videos)} videos en tu colección"
+        if info["total_videos"]:
+            counts += f" · {info['total_videos']} en total"
+        self.channel_meta.setText(f"{counts} · {clock(total) or '0:00'}")
+        details = []
+        if info["country"]:
+            details.append(info["country"])
+        created = QDate.fromString(info["created"], "yyyy-MM-dd")
+        if created.isValid():
+            details.append(f"Creado el {created.toString('dd/MM/yyyy')}")
+        self.channel_details.setText(" · ".join(details))
+        self.channel_details.setVisible(bool(details))
+        avatar = QPixmap(info["avatar"]) if info["avatar"] else QPixmap()
+        if avatar.isNull() and videos:
+            avatar = self.thumbs.get(videos[0])
+        self.channel_avatar.setPixmap(dialogs.round_avatar(avatar, 72))
         self.channel_model.set_items(videos)
         self.pages.setCurrentWidget(self.channel_page)
+
+    def _edit_channel(self) -> None:
+        if not self.current_channel:
+            return
+        dialog = dialogs.ChannelDialog(self.catalog, self.current_channel, len(self.channel_model.items), self)
+        if dialog.exec() == dialogs.QDialog.DialogCode.Accepted:
+            self.show_channel(self.current_channel)
+
+    def _channel_cover(self, channel: dict) -> dict:
+        """Lo que se pinta en la tarjeta del canal: su foto si la tiene; si no, su primer vídeo."""
+        avatar = self.catalog.channel(channel["name"])["avatar"]
+        if not avatar:
+            return channel["videos"][0]
+        # Un «elemento» de mentira con la foto como portada: así la caché de miniaturas la trata igual.
+        # Número negativo que cabe en 32 bits: Qt pasa el id por una señal de enteros.
+        return {"id": -1 - (zlib.crc32(avatar.encode()) & 0x7FFFFFFF), "mtime": 0, "cover": avatar, "kind": "video", "status": "ok",
+                "rel_path": "", "root_path": ""}
 
     def ask_resume(self, item: dict, position_ms: int) -> bool:
         """Pregunta si se sigue donde se dejó. True: continuar; False: desde el principio."""

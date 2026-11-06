@@ -65,6 +65,13 @@ CREATE TABLE IF NOT EXISTS list_folders (
     name TEXT NOT NULL,
     parent_id INTEGER
 );
+CREATE TABLE IF NOT EXISTS channels (
+    name TEXT PRIMARY KEY COLLATE NOCASE,
+    avatar TEXT NOT NULL DEFAULT '',
+    created TEXT NOT NULL DEFAULT '',
+    country TEXT NOT NULL DEFAULT '',
+    total_videos INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS activity (
     item_id INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
     play_count INTEGER NOT NULL DEFAULT 0,
@@ -277,6 +284,27 @@ class Catalog:
             f"SELECT DISTINCT {expr} AS name FROM items i WHERE {expr} <> '' ORDER BY name COLLATE NOCASE"
         )
         return [r["name"] for r in rows]
+
+    # Canales de los videos favoritos: datos que el usuario escribe a mano
+
+    CHANNEL_DEFAULTS = {"avatar": "", "created": "", "country": "", "total_videos": 0}
+
+    def channel(self, name: str) -> dict:
+        row = self.conn.execute("SELECT * FROM channels WHERE name = ?", (name,)).fetchone()
+        return dict(row) if row else {"name": name, **self.CHANNEL_DEFAULTS}
+
+    def save_channel(self, name: str, **fields) -> None:
+        unknown = set(fields) - set(self.CHANNEL_DEFAULTS)
+        if unknown:
+            raise ValueError(unknown)
+        current = {**self.channel(name), **fields, "name": name}
+        self.conn.execute(
+            "INSERT INTO channels (name, avatar, created, country, total_videos) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET avatar = excluded.avatar, created = excluded.created, "
+            "country = excluded.country, total_videos = excluded.total_videos",
+            (name, current["avatar"], current["created"], current["country"], current["total_videos"]),
+        )
+        self.conn.commit()
 
     # Actividad: reproducciones, posición para continuar y vistos
 

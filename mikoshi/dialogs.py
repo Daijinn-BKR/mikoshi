@@ -1,15 +1,19 @@
 """Ventanas auxiliares: ajustes, edición masiva, búsqueda en internet e informes."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QPixmap
+import time
+from pathlib import Path
+
+from PySide6.QtCore import QDate, Qt, QThread, Signal
+from PySide6.QtGui import QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QApplication, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSpinBox, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout,
 )
 
 from . import metadata, online
-from .db import Catalog
+from .db import Catalog, covers_dir
 
 # Hilos cortos en marcha. Se guardan aquí porque pueden terminar después de cerrar su ventana.
 _running: set[QThread] = set()
@@ -290,6 +294,127 @@ class ReportDialog(QDialog):
         close.rejected.connect(self.accept)
         row.addWidget(close)
         layout.addLayout(row)
+
+
+COUNTRIES = [
+    "", "Argentina", "Bolivia", "Brasil", "Canadá", "Chile", "China", "Colombia", "Corea del Sur", "Costa Rica",
+    "Cuba", "Ecuador", "El Salvador", "España", "Estados Unidos", "Francia", "Alemania", "Guatemala", "Honduras",
+    "India", "Italia", "Japón", "México", "Nicaragua", "Panamá", "Paraguay", "Perú", "Polonia", "Portugal",
+    "Puerto Rico", "Reino Unido", "República Dominicana", "Rusia", "Suecia", "Uruguay", "Venezuela",
+]
+
+
+def round_avatar(source: QPixmap, size: int) -> QPixmap:
+    """Foto de perfil recortada en círculo, como en YouTube."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    if source.isNull():
+        return pixmap
+    scaled = source.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                           Qt.TransformationMode.SmoothTransformation)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    path = QPainterPath()
+    path.addEllipse(0, 0, size, size)
+    painter.setClipPath(path)
+    painter.drawPixmap((size - scaled.width()) // 2, (size - scaled.height()) // 2, scaled)
+    painter.end()
+    return pixmap
+
+
+class ChannelDialog(QDialog):
+    """Datos de un canal. Solo se guardan en el catálogo; los vídeos no cambian."""
+
+    def __init__(self, catalog: Catalog, name: str, videos_here: int, parent=None):
+        super().__init__(parent)
+        self.catalog, self.name = catalog, name
+        info = catalog.channel(name)
+        self.avatar_path = info["avatar"]
+        self.setWindowTitle(f"Editar canal · {name}")
+        self.setMinimumWidth(420)
+
+        self.avatar = QLabel(alignment=Qt.AlignmentFlag.AlignCenter)
+        self.avatar.setFixedSize(120, 120)
+        choose = QPushButton("Elegir foto…")
+        remove = QPushButton("Quitar foto")
+        choose.clicked.connect(self._choose_avatar)
+        remove.clicked.connect(lambda: self._set_avatar(""))
+        photo_buttons = QVBoxLayout()
+        photo_buttons.addStretch()
+        photo_buttons.addWidget(choose)
+        photo_buttons.addWidget(remove)
+        photo_buttons.addStretch()
+        photo = QHBoxLayout()
+        photo.addWidget(self.avatar)
+        photo.addLayout(photo_buttons)
+        photo.addStretch()
+
+        self.created_known = QCheckBox("Conozco la fecha")
+        self.created = QDateEdit(calendarPopup=True)
+        self.created.setDisplayFormat("dd/MM/yyyy")
+        self.created.setMaximumDate(QDate.currentDate())
+        date = QDate.fromString(info["created"], "yyyy-MM-dd")
+        self.created_known.setChecked(date.isValid())
+        self.created.setDate(date if date.isValid() else QDate(2015, 1, 1))
+        self.created.setEnabled(date.isValid())
+        self.created_known.toggled.connect(self.created.setEnabled)
+        created_row = QHBoxLayout()
+        created_row.addWidget(self.created_known)
+        created_row.addWidget(self.created, 1)
+
+        self.country = QComboBox(editable=True)
+        self.country.addItems(COUNTRIES)
+        self.country.setCurrentText(info["country"])
+        self.country.lineEdit().setPlaceholderText("Escribe o elige un país")
+
+        self.total = QSpinBox()
+        self.total.setRange(0, 10_000_000)
+        self.total.setSpecialValueText("Desconocida")
+        self.total.setValue(info["total_videos"])
+        here = QLabel(f"En tu colección hay {videos_here}.")
+        here.setProperty("muted", True)
+
+        form = QFormLayout()
+        form.addRow("Foto de perfil", photo)
+        form.addRow("Fecha de creación", created_row)
+        form.addRow("País de origen", self.country)
+        form.addRow("Videos en total", self.total)
+        form.addRow("", here)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self._set_avatar(self.avatar_path)
+
+    def _set_avatar(self, path: str) -> None:
+        self.avatar_path = path
+        source = QPixmap(path) if path else QPixmap()
+        self.avatar.setPixmap(round_avatar(source, 120))
+        self.avatar.setText("" if not source.isNull() else "Sin foto")
+
+    def _choose_avatar(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Foto de perfil", "", "Imágenes (*.jpg *.jpeg *.png *.webp *.bmp)")
+        if path:
+            self._set_avatar(path)
+
+    def _save(self) -> None:
+        info = self.catalog.channel(self.name)
+        avatar = info["avatar"]
+        if self.avatar_path != avatar:
+            # La foto se copia junto a las portadas: así entra en las copias de seguridad del catálogo.
+            if avatar:
+                (covers_dir() / Path(avatar).name).unlink(missing_ok=True)
+            avatar = ""
+            if self.avatar_path:
+                dest = covers_dir() / f"canal-{time.time_ns()}{Path(self.avatar_path).suffix.lower()}"
+                dest.write_bytes(Path(self.avatar_path).read_bytes())
+                avatar = str(dest)
+        self.catalog.save_channel(
+            self.name, avatar=avatar, country=self.country.currentText().strip(), total_videos=self.total.value(),
+            created=self.created.date().toString("yyyy-MM-dd") if self.created_known.isChecked() else "")
+        self.accept()
 
 
 def confirm(parent, title: str, text: str) -> bool:
