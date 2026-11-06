@@ -15,8 +15,9 @@ from urllib.parse import unquote
 
 from .db import covers_dir, data_dir, full_path
 
-SIZE = (400, 400)
-CACHE_VERSION = "2"
+# Suficiente para una tarjeta grande en una pantalla al 150 % sin estirar la imagen.
+SIZE = (960, 960)
+CACHE_VERSION = "3"
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
@@ -27,7 +28,7 @@ def _save(source, dest: Path) -> bool:
         img.draft("RGB", SIZE)
         img = ImageOps.exif_transpose(img).convert("RGB")
         img.thumbnail(SIZE)
-        img.save(dest, "JPEG", quality=85)
+        img.save(dest, "JPEG", quality=92)
     return True
 
 

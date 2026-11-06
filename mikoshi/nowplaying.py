@@ -4,14 +4,14 @@ from __future__ import annotations
 import os
 import random
 
-from PySide6.QtCore import QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QPainter, QPixmap
+from PySide6.QtCore import Qt, QUrl, Signal
+from PySide6.QtGui import QPainter
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QMenu, QPushButton, QSlider, QVBoxLayout, QWidget
 
 from .db import display_title, effective, full_path
 from .player import SeekSlider, format_time
-from .widgets import draw_cover
+from .widgets import draw_cover, hidpi_canvas
 
 REPEAT_MODES = [("off", "Repetir: no"), ("all", "Repetir: todo"), ("one", "Repetir: una")]
 
@@ -261,8 +261,7 @@ class NowPlayingBar(QWidget):
         item = self.current
         if not item:
             return
-        pixmap = QPixmap(QSize(48, 48))
-        pixmap.fill(Qt.GlobalColor.transparent)
+        pixmap = hidpi_canvas(48, 48)
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         draw_cover(painter, self.thumbs.get(item), pixmap.rect(), 4)

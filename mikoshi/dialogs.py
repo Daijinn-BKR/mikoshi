@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QDate, Qt, QThread, Signal
+from PySide6.QtCore import QDate, QRect, Qt, QThread, Signal
 from PySide6.QtGui import QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 
 from . import metadata, online
 from .db import Catalog, covers_dir
+from .widgets import draw_cover, hidpi_canvas
 
 # Hilos cortos en marcha. Se guardan aquí porque pueden terminar después de cerrar su ventana.
 _running: set[QThread] = set()
@@ -306,18 +307,15 @@ COUNTRIES = [
 
 def round_avatar(source: QPixmap, size: int) -> QPixmap:
     """Foto de perfil recortada en círculo, como en YouTube."""
-    pixmap = QPixmap(size, size)
-    pixmap.fill(Qt.GlobalColor.transparent)
+    pixmap = hidpi_canvas(size, size)
     if source.isNull():
         return pixmap
-    scaled = source.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                           Qt.TransformationMode.SmoothTransformation)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     path = QPainterPath()
     path.addEllipse(0, 0, size, size)
     painter.setClipPath(path)
-    painter.drawPixmap((size - scaled.width()) // 2, (size - scaled.height()) // 2, scaled)
+    draw_cover(painter, source, QRect(0, 0, size, size), 0)
     painter.end()
     return pixmap
 

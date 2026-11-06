@@ -6,10 +6,15 @@ import re
 import subprocess
 import sys
 import time
+import weakref
 from collections import OrderedDict
 
-from PySide6.QtCore import QAbstractListModel, QModelIndex, QObject, QRect, QRunnable, QSize, Qt, QThreadPool, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QImage, QLinearGradient, QPainter, QPainterPath, QPixmap
+from PySide6.QtCore import (
+    QAbstractListModel, QModelIndex, QObject, QPointF, QRect, QRunnable, QSize, Qt, QThreadPool, Signal,
+)
+from PySide6.QtGui import (
+    QBrush, QColor, QFont, QGuiApplication, QImage, QLinearGradient, QPainter, QPainterPath, QPixmap,
+)
 from PySide6.QtWidgets import QAbstractItemView, QListView, QStyle, QStyledItemDelegate
 
 from . import metadata, thumbnails
@@ -143,12 +148,14 @@ class ThumbJob(QRunnable):
 
 class Thumbs(QObject):
     updated = Signal(int)
-    MAX_CACHED = 3000
+    # Límite de memoria de las miniaturas ya cargadas; las menos usadas salen primero.
+    MAX_BYTES = 384 * 1024 * 1024
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.placeholders = {kind: placeholder(kind) for kind in KIND_STYLE}
         self.pixmaps: OrderedDict[str, QPixmap] = OrderedDict()
+        self.cached_bytes = 0
         self.requested: set[str] = set()
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(4)
@@ -170,15 +177,27 @@ class Thumbs(QObject):
             self.pool.start(ThumbJob(item, key, self.signals))
         return self.placeholders[item["kind"]]
 
+    @staticmethod
+    def _bytes(pixmap: QPixmap) -> int:
+        return pixmap.width() * pixmap.height() * 4
+
     def has(self, item: dict) -> bool:
         return self.key(item) in self.pixmaps
 
     def _ready(self, item_id: int, key: str, image: QImage) -> None:
         if image.isNull():
             return
-        self.pixmaps[key] = QPixmap.fromImage(image)
-        while len(self.pixmaps) > self.MAX_CACHED:
-            self.pixmaps.popitem(last=False)
+        pixmap = QPixmap.fromImage(image)
+        old = self.pixmaps.pop(key, None)
+        if old is not None:
+            self.cached_bytes -= self._bytes(old)
+        self.pixmaps[key] = pixmap
+        self.cached_bytes += self._bytes(pixmap)
+        while self.cached_bytes > self.MAX_BYTES and len(self.pixmaps) > 1:
+            _key, evicted = self.pixmaps.popitem(last=False)
+            self.cached_bytes -= self._bytes(evicted)
+            # Si vuelve a hacer falta, se pide de nuevo; la caché del disco la sirve al instante.
+            self.requested.discard(_key)
         self.updated.emit(item_id)
 
     def shutdown(self) -> None:
@@ -193,6 +212,15 @@ BADGE_ROLE = Qt.ItemDataRole.UserRole + 2
 PROGRESS_ROLE = Qt.ItemDataRole.UserRole + 3
 
 
+# Modelos y listas vivos que muestran elementos: al guardar uno, todos lo actualizan al momento.
+LIVE_VIEWS: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def item_changed_everywhere(item: dict) -> None:
+    for view in list(LIVE_VIEWS):
+        view.update_item(item)
+
+
 class CardModel(QAbstractListModel):
     """Lista de tarjetas. `subtitle`, `badge` y `progress` son funciones que reciben el elemento."""
 
@@ -202,6 +230,7 @@ class CardModel(QAbstractListModel):
         self.title, self.subtitle, self.badge, self.progress = title, subtitle, badge, progress
         self.cover_of = lambda item: item
         thumbs.updated.connect(self._thumb_updated)
+        LIVE_VIEWS.add(self)
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self.items)
@@ -227,6 +256,12 @@ class CardModel(QAbstractListModel):
         self.items = list(items)
         self.endResetModel()
 
+    def update_item(self, fresh: dict) -> None:
+        for row, item in enumerate(self.items):
+            if isinstance(item, dict) and item.get("id") == fresh["id"] and "rel_path" in item:
+                self.items[row] = fresh
+                self.dataChanged.emit(self.index(row), self.index(row))
+
     def _thumb_updated(self, item_id: int) -> None:
         for row, item in enumerate(self.items):
             if self.cover_of(item)["id"] == item_id:
@@ -234,17 +269,40 @@ class CardModel(QAbstractListModel):
                 self.dataChanged.emit(index, index, [Qt.ItemDataRole.DecorationRole])
 
 
+def screen_ratio() -> float:
+    """Escalado de Windows (1.25 al 125 %, 1.5 al 150 %…)."""
+    screen = QGuiApplication.primaryScreen()
+    return screen.devicePixelRatio() if screen else 1.0
+
+
+def hidpi_canvas(width: int, height: int) -> QPixmap:
+    """Lienzo transparente con tantos píxeles reales como tenga la pantalla, no los del tamaño lógico."""
+    ratio = screen_ratio()
+    pixmap = QPixmap(round(width * ratio), round(height * ratio))
+    pixmap.setDevicePixelRatio(ratio)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    return pixmap
+
+
 def draw_cover(painter: QPainter, pixmap: QPixmap, rect: QRect, radius: int = 6) -> None:
-    """Rellena el rectángulo recortando la imagen, sin deformarla."""
+    """Rellena el rectángulo recortando la imagen, sin deformarla.
+
+    La imagen se reduce a los píxeles reales de la pantalla: con el escalado de Windows al 125 % o
+    150 %, reducirla al tamaño lógico y dejar que se estire después la volvería borrosa.
+    """
     path = QPainterPath()
     path.addRoundedRect(rect, radius, radius)
     painter.save()
     painter.setClipPath(path)
-    scaled = pixmap.scaled(rect.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+    device = painter.device()
+    ratio = device.devicePixelRatioF() if device else 1.0
+    target = QSize(round(rect.width() * ratio), round(rect.height() * ratio))
+    scaled = pixmap.scaled(target, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                            Qt.TransformationMode.SmoothTransformation)
-    x = rect.x() + (rect.width() - scaled.width()) // 2
-    y = rect.y() + (rect.height() - scaled.height()) // 2
-    painter.drawPixmap(x, y, scaled)
+    scaled.setDevicePixelRatio(ratio)
+    x = rect.x() + (rect.width() - scaled.width() / ratio) / 2
+    y = rect.y() + (rect.height() - scaled.height() / ratio) / 2
+    painter.drawPixmap(QPointF(x, y), scaled)
     painter.restore()
 
 

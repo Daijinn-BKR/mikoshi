@@ -27,7 +27,9 @@ from .nowplaying import NowPlayingBar
 from .player import PLAYABLE, PlayerDialog, PlayerHooks
 from .sections import BooksSection, CinemaSection, FavoritesSection, GamesSection, MusicSection
 from .theme import apply_theme
-from .widgets import Thumbs, creator, human_size, number, open_path, reveal_path, stars, year
+from .widgets import (
+    Thumbs, creator, human_size, item_changed_everywhere, number, open_path, reveal_path, screen_ratio, stars, year,
+)
 
 BACKUP_INTERVAL = 24 * 3600
 SORT_OPTIONS = [
@@ -440,8 +442,12 @@ class DetailPanel(QScrollArea):
         self.write_hint.setText("Datos de internet sin guardar: revísalos y pulsa «Guardar en catálogo».")
 
     def set_thumbnail(self, pixmap: QPixmap) -> None:
-        self.cover.setPixmap(pixmap.scaled(QSize(240, 240), Qt.AspectRatioMode.KeepAspectRatio,
-                                           Qt.TransformationMode.SmoothTransformation))
+        # A la resolución real de la pantalla, para que no se vea borrosa con el escalado de Windows.
+        ratio = screen_ratio()
+        scaled = pixmap.scaled(QSize(round(240 * ratio), round(240 * ratio)), Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+        scaled.setDevicePixelRatio(ratio)
+        self.cover.setPixmap(scaled)
 
     def show_multiple(self, count: int) -> None:
         self.show_item(None)
@@ -784,7 +790,14 @@ class MainWindow(QMainWindow):
         panel.show_item(item)
         panel.set_thumbnail(self.thumbs.get(item))
         panel.saved.connect(self._item_saved)
-        panel.saved.connect(lambda _id: panel.set_thumbnail(self.thumbs.get(panel.item)))
+
+        def refresh_preview(changed_id: int = None) -> None:
+            # Al guardar o al terminar de crearse la miniatura nueva: la vista previa cambia al momento.
+            if panel.item and changed_id in (None, panel.item["id"]):
+                panel.set_thumbnail(self.thumbs.get(panel.item))
+
+        panel.saved.connect(lambda _id: refresh_preview())
+        self.thumbs.updated.connect(refresh_preview)
         panel.write_requested.connect(lambda: self._write_files([item_id]))
         panel.play_requested.connect(lambda: self.play_items([panel.item], 0))
         layout = QVBoxLayout(dialog)
@@ -795,6 +808,7 @@ class MainWindow(QMainWindow):
         dialog.finished.connect(lambda _r: panel.commit())
         self.editor = panel
         dialog.exec()
+        self.thumbs.updated.disconnect(refresh_preview)
         self.editor = None
 
     # Menús y barra
@@ -1128,6 +1142,8 @@ class MainWindow(QMainWindow):
         item = self.catalog.get_item(item_id)
         if item:
             self.model.update_item(item)
+            # Las tarjetas y listas de todas las pestañas se enteran ya, sin esperar a cerrar nada.
+            item_changed_everywhere(item)
             self.status_label.setText(f"Guardado en el catálogo: {display_title(item)}")
 
     def _context_menu(self, position) -> None:

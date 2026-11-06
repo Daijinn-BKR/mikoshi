@@ -820,3 +820,79 @@ def test_channel_dialog_unknown_values_are_saved_empty(window):
     dialog._save()
     assert window.catalog.channel("Nadie") == {"name": "Nadie", "avatar": "", "created": "", "country": "",
                                                "total_videos": 0}
+
+
+def test_covers_are_drawn_at_real_screen_resolution(app):
+    from PySide6.QtCore import QRect
+    from PySide6.QtGui import QImage, QPainter, QPixmap
+    from mikoshi.widgets import draw_cover
+
+    stripes = QImage(200, 200, QImage.Format.Format_RGB32)
+    for x in range(200):
+        for y in range(200):
+            stripes.setPixelColor(x, y, Qt.GlobalColor.black if x % 2 else Qt.GlobalColor.white)
+    canvas = QPixmap(200, 200)
+    canvas.setDevicePixelRatio(2.0)
+    painter = QPainter(canvas)
+    draw_cover(painter, QPixmap.fromImage(stripes), QRect(0, 0, 100, 100), 0)
+    painter.end()
+    image = canvas.toImage()
+    # A 200 % la imagen conserva sus líneas de 1 píxel; reducida a 100 y estirada serían gris.
+    contrast = abs(image.pixelColor(40, 40).lightness() - image.pixelColor(41, 40).lightness())
+    assert contrast > 150, contrast
+
+
+def test_thumbnails_are_large_and_sharp(tmp_path):
+    from mikoshi import thumbnails
+
+    big = tmp_path / "grande.jpg"
+    Image.new("RGB", (2560, 1440), "white").save(big)
+    out = tmp_path / "mini.jpg"
+    thumbnails._save(str(big), out)
+    assert Image.open(out).size == (960, 540)
+
+
+def test_thumbnail_memory_is_bounded(app):
+    from PySide6.QtGui import QImage
+    from mikoshi.widgets import Thumbs
+
+    thumbs = Thumbs()
+    thumbs.MAX_BYTES = 3 * 100 * 100 * 4
+    for n in range(6):
+        image = QImage(100, 100, QImage.Format.Format_RGB32)
+        thumbs.requested.add(f"k{n}")
+        thumbs._ready(n, f"k{n}", image)
+    assert list(thumbs.pixmaps) == ["k3", "k4", "k5"]
+    assert thumbs.cached_bytes == 3 * 100 * 100 * 4 and "k0" not in thumbs.requested
+
+
+def test_new_cover_shows_at_once_in_cards_and_editor(window, monkeypatch):
+    import io as _io
+    from PySide6.QtWidgets import QDialog
+
+    favorites = favorites_with_root(window)
+    video = favorites.model.items[0]
+    jpeg = _io.BytesIO()
+    Image.new("RGB", (64, 36), "red").save(jpeg, "JPEG")
+    seen = {}
+
+    def fake_exec(dialog):
+        panel = window.editor
+        before = panel.cover.pixmap().cacheKey()
+        panel.apply_online({}, jpeg.getvalue())
+        fresh = panel.item
+        # Sin cerrar la ventana: la tarjeta de la pestaña ya usa la portada nueva…
+        seen["card"] = next(i for i in favorites.model.items if i["id"] == video["id"])["cover"] == fresh["cover"]
+        # …y la vista previa cambia en cuanto la miniatura nueva está lista.
+        wait_until(lambda: window.thumbs.has(fresh))
+        wait_until(lambda: panel.cover.pixmap().cacheKey() != before)
+        center = panel.cover.pixmap().toImage().pixelColor(panel.cover.pixmap().width() // 2,
+                                                           panel.cover.pixmap().height() // 2)
+        seen["preview_red"] = center.red() > 200 and center.green() < 60
+        dialog.done(0)
+        return 0
+
+    monkeypatch.setattr(QDialog, "exec", fake_exec)
+    window.edit_item(video["id"])
+    assert seen == {"card": True, "preview_red": True}
+    favorites.refresh()

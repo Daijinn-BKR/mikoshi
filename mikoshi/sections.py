@@ -23,7 +23,7 @@ from . import dialogs, online, thumbnails
 from .db import display_title, effective, full_path
 from .player import PlayerHooks, PlayerWidget
 from .widgets import (
-    POSTER, SQUARE, WIDE, CardModel, card_view, clock, draw_cover, human_size, number, open_path,
+    LIVE_VIEWS, POSTER, SQUARE, WIDE, CardModel, card_view, clock, draw_cover, hidpi_canvas, human_size, number, open_path,
     reveal_path, seconds, stars, video_category, year, ago,
 )
 
@@ -41,8 +41,7 @@ def muted(text: str = "") -> QLabel:
 
 
 def cover_pixmap(source: QPixmap, width: int, height: int) -> QPixmap:
-    pixmap = QPixmap(width, height)
-    pixmap.fill(Qt.GlobalColor.transparent)
+    pixmap = hidpi_canvas(width, height)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     draw_cover(painter, source, pixmap.rect(), 8)
@@ -75,6 +74,13 @@ class IconBinder:
         self.thumbs = thumbs
         self.entries: dict[int, list] = defaultdict(list)
         thumbs.updated.connect(self._updated)
+        LIVE_VIEWS.add(self)
+
+    def update_item(self, fresh: dict) -> None:
+        """El elemento cambió (por ejemplo, su portada): las filas lo usan ya actualizado."""
+        entries = self.entries.get(fresh["id"], [])
+        self.entries[fresh["id"]] = [(owner, entry, fresh, make) for owner, entry, _old, make in entries]
+        self._updated(fresh["id"])
 
     def clear(self, owner) -> None:
         for item_id in list(self.entries):
@@ -340,12 +346,19 @@ class MusicSection(Section):
 # Libros
 
 class BookModel(QAbstractTableModel):
+    def update_item(self, fresh: dict) -> None:
+        for row, item in enumerate(self.items):
+            if item["id"] == fresh["id"]:
+                self.items[row] = fresh
+                self.dataChanged.emit(self.index(row, 0), self.index(row, len(self.COLUMNS) - 1))
+
     COLUMNS = ["Título", "Autor", "Serie", "Año", "Editorial", "Género", "Valoración", "Formato", "Tamaño"]
 
     def __init__(self, thumbs, parent=None):
         super().__init__(parent)
         self.thumbs, self.items = thumbs, []
         thumbs.updated.connect(self._thumb_updated)
+        LIVE_VIEWS.add(self)
 
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self.items)
