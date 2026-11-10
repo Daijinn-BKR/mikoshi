@@ -135,16 +135,26 @@ class PlayerHooks:
 
 
 class SeekSlider(QSlider):
-    """Barra de progreso: un clic salta a ese punto, como en YouTube, y también se puede arrastrar."""
+    """Barra de progreso o de volumen: un clic va justo a ese punto, como en YouTube, y se puede arrastrar."""
 
     def __init__(self, parent=None):
         super().__init__(Qt.Orientation.Horizontal, parent)
 
+    def value_at(self, x: float) -> int:
+        """Valor bajo el punto pulsado, contando con el ancho del asa para que el 25 % caiga en el 25 %."""
+        from PySide6.QtWidgets import QStyleOptionSlider
+
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        handle = self.style().subControlRect(QStyle.ComplexControl.CC_Slider, option,
+                                             QStyle.SubControl.SC_SliderHandle, self).width()
+        span = max(1, self.width() - handle)
+        return QStyle.sliderValueFromPosition(self.minimum(), self.maximum(),
+                                              round(x - handle / 2), span)
+
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton and self.maximum() > self.minimum():
-            value = QStyle.sliderValueFromPosition(self.minimum(), self.maximum(),
-                                                   int(event.position().x()), self.width())
-            self.setValue(value)
+            self.setValue(self.value_at(event.position().x()))
         # El asa ya está bajo el cursor: el comportamiento normal permite seguir arrastrando.
         super().mousePressEvent(event)
 
@@ -243,7 +253,7 @@ class PlayerWidget(QWidget):
             button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.position = SeekSlider()
         self.time_label = QLabel("0:00 / 0:00")
-        self.volume = QSlider(Qt.Orientation.Horizontal)
+        self.volume = SeekSlider()
         self.volume.setRange(0, 100)
         self.volume.setValue(80)
         self.volume.setFixedWidth(100)

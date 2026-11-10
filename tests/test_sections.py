@@ -11,6 +11,8 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
 
 from mikoshi import dialogs, metadata, online, scanner
 from mikoshi.db import Catalog, effective
+from mikoshi.widgets import BADGE_ROLE, SUBTITLE_ROLE, clock, seconds
+from PySide6.QtGui import QPixmap
 
 
 def wait_until(condition, ms=20000):
@@ -788,7 +790,6 @@ def test_edit_channel_profile_shows_on_channel_page(window, tmp_path, monkeypatc
     def fill(dialog):
         if isinstance(dialog, dialogs.ChannelDialog):
             dialog._set_avatar(str(photo))
-            dialog.created_known.setChecked(True)
             dialog.created.setDate(QDate(2014, 5, 2))
             dialog.country.setCurrentText("Japón")
             dialog.total.setValue(340)
@@ -816,7 +817,8 @@ def test_edit_channel_profile_shows_on_channel_page(window, tmp_path, monkeypatc
 
 def test_channel_dialog_unknown_values_are_saved_empty(window):
     dialog = dialogs.ChannelDialog(window.catalog, "Nadie", 3)
-    assert not dialog.created.isEnabled() and dialog.total.text() == "Desconocida"
+    assert dialog.created.is_empty() and dialog.created.text() == "Sin fecha"
+    assert dialog.total.text() == "Desconocida"
     dialog._save()
     assert window.catalog.channel("Nadie") == {"name": "Nadie", "avatar": "", "created": "", "country": "",
                                                "total_videos": 0}
@@ -896,3 +898,134 @@ def test_new_cover_shows_at_once_in_cards_and_editor(window, monkeypatch):
     window.edit_item(video["id"])
     assert seen == {"card": True, "preview_red": True}
     favorites.refresh()
+
+
+def test_channel_cards_have_right_click_edit(window, monkeypatch):
+    favorites = favorites_with_root(window)
+    favorites.show_channels()
+    name = favorites.channels_model.items[0]["name"]
+    menu = favorites.channel_menu(name)
+    assert [a.text() for a in menu.actions()] == ["Ver canal", "Editar canal…"]
+    edited = []
+    monkeypatch.setattr(dialogs.ChannelDialog, "exec", lambda self: edited.append(self.name) or 0)
+    next(a for a in menu.actions() if a.text() == "Editar canal…").trigger()
+    assert edited == [name]
+
+
+def test_channel_date_is_edited_directly(window):
+    from PySide6.QtCore import QDate
+    from PySide6.QtTest import QTest
+
+    dialog = dialogs.ChannelDialog(window.catalog, "Fechas", 0)
+    dialog.show()
+    assert dialog.created.is_empty() and dialog.created.text() == "Sin fecha"
+    assert not hasattr(dialog, "created_known")
+    # Abrir la ventana no pone ninguna fecha por su cuenta.
+    dialog._save()
+    assert window.catalog.channel("Fechas")["created"] == ""
+    dialog = dialogs.ChannelDialog(window.catalog, "Fechas", 0)
+    dialog.show()
+    QTest.mouseClick(dialog.created, Qt.MouseButton.LeftButton)
+    assert dialog.created.date() == QDate.currentDate()
+    dialog.created.setDate(QDate(2016, 3, 9))
+    dialog._save()
+    assert window.catalog.channel("Fechas")["created"] == "2016-03-09"
+    dialog = dialogs.ChannelDialog(window.catalog, "Fechas", 0)
+    assert dialog.created.date() == QDate(2016, 3, 9)
+    clear = next(b for b in dialog.findChildren(QPushButton) if b.text() == "✕")
+    clear.click()
+    dialog._save()
+    assert window.catalog.channel("Fechas")["created"] == ""
+
+
+def test_clicking_total_videos_selects_the_number(window):
+    from PySide6.QtTest import QTest
+
+    window.catalog.save_channel("Contador", total_videos=340)
+    dialog = dialogs.ChannelDialog(window.catalog, "Contador", 0)
+    dialog.show()
+    QTest.mouseClick(dialog.total, Qt.MouseButton.LeftButton)
+    QTest.qWait(50)
+    assert dialog.total.lineEdit().selectedText() == "340"
+    QTest.keyClicks(dialog.total, "125")
+    assert dialog.total.value() == 125
+
+
+def test_volume_click_goes_straight_to_clicked_point(window):
+    from PySide6.QtCore import QPoint
+    from PySide6.QtTest import QTest
+
+    for slider in (window.now_playing.volume, favorites_with_root(window).player.volume):
+        slider.setValue(80)
+        slider.resize(200, 20)
+        slider.show()
+        x =round(slider.width() * 0.25)
+        expected = slider.value_at(x)
+        QTest.mouseClick(slider, Qt.MouseButton.LeftButton, pos=QPoint(x, 10))
+        assert slider.value() == expected
+        # El asa queda justo bajo el cursor: no avanza a saltitos.
+        from PySide6.QtWidgets import QStyle, QStyleOptionSlider
+
+        option = QStyleOptionSlider()
+        slider.initStyleOption(option)
+        handle = slider.style().subControlRect(QStyle.ComplexControl.CC_Slider, option,
+                                               QStyle.SubControl.SC_SliderHandle, slider)
+        assert abs(handle.center().x() - x) <= 2
+        QTest.mouseClick(slider, Qt.MouseButton.LeftButton, pos=QPoint(slider.width() - 1, 10))
+        assert slider.value() == 100
+        QTest.mouseClick(slider, Qt.MouseButton.LeftButton, pos=QPoint(0, 10))
+        assert slider.value() == 0
+
+
+def test_up_next_rows_have_fixed_size_and_details(window):
+    favorites = favorites_with_root(window)
+    favorites.watch(favorites.model.items, 0)
+    entry = favorites.up_next.item(0)
+    assert entry.text() == titles([favorites.player.items[1]])[0]
+    assert entry.data(BADGE_ROLE) == clock(seconds(favorites.player.items[1]))
+    assert "reproducciones" in entry.data(SUBTITLE_ROLE)
+    assert isinstance(entry.data(Qt.ItemDataRole.DecorationRole), QPixmap)
+    from PySide6.QtWidgets import QStyleOptionViewItem
+
+    size = favorites.up_next.itemDelegate().sizeHint(QStyleOptionViewItem(), favorites.up_next.model().index(0, 0))
+    assert size.height() == 104
+    assert not favorites.up_next.grab().isNull()
+    favorites._back()
+
+
+def test_shuffle_reorders_up_next_on_every_click(window):
+    favorites = favorites_with_root(window)
+    videos = list(favorites.model.items)
+    favorites.watch(videos, 0)
+    # Cinco vídeos por delante, para que haya muchos órdenes posibles.
+    favorites.player.items = [videos[0]] + [dict(videos[1], id=1000 + n) for n in range(5)]
+    assert not favorites.shuffle_button.isCheckable()
+    orders = [[v["id"] for v in favorites.player.items[1:]]]
+    for _click in range(5):
+        favorites.shuffle_button.click()
+        assert favorites.player.items[0]["id"] == videos[0]["id"]
+        order = [v["id"] for v in favorites.player.items[1:]]
+        assert sorted(order) == sorted(orders[0])
+        assert order != orders[-1]
+        assert favorites.up_next.item(0).text() == titles([favorites.player.items[1]])[0]
+        orders.append(order)
+    favorites._back()
+    favorites.watch(videos, 0)
+    assert [v["id"] for v in favorites.player.items] == [v["id"] for v in videos]
+    favorites._back()
+
+
+def test_channel_button_shows_profile_photo(window, tmp_path):
+    favorites = favorites_with_root(window)
+    favorites.watch(favorites.model.items, 0)
+    letter = favorites.channel_button.icon().pixmap(28, 28).toImage()
+    assert not letter.isNull()
+    photo = tmp_path / "p.png"
+    Image.new("RGB", (40, 40), "red").save(photo)
+    window.catalog.save_channel("Sin autor", avatar=str(photo))
+    favorites._show_info(favorites.player.item)
+    image = favorites.channel_button.icon().pixmap(28, 28).toImage()
+    center = image.pixelColor(image.width() // 2, image.height() // 2)
+    assert center.red() > 200 and center.green() < 60
+    window.catalog.save_channel("Sin autor", avatar="")
+    favorites._back()

@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QRect, Qt, QThread, Signal
+from PySide6.QtCore import QDate, QRect, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDateEdit, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
@@ -320,6 +320,89 @@ def round_avatar(source: QPixmap, size: int) -> QPixmap:
     return pixmap
 
 
+NO_DATE = QDate(1900, 1, 1)
+
+
+class OptionalDateEdit(QDateEdit):
+    """Fecha que puede quedar vacía: muestra «Sin fecha» y, al tocarla, propone la de hoy para editarla."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setCalendarPopup(True)
+        self.setDisplayFormat("dd/MM/yyyy")
+        self.setMinimumDate(NO_DATE)
+        self.setMaximumDate(QDate.currentDate())
+        self.setSpecialValueText("Sin fecha")
+        self.clear_date()
+
+    def is_empty(self) -> bool:
+        return self.date() == NO_DATE
+
+    def clear_date(self) -> None:
+        self.setDate(NO_DATE)
+
+    def _start_editing(self) -> None:
+        if self.is_empty():
+            self.setDate(QDate.currentDate())
+            self.setSelectedSection(QDateEdit.Section.DaySection)
+
+    def mousePressEvent(self, event) -> None:
+        on_calendar_arrow = event.position().x() > self.width() - 28
+        if self.is_empty() and not on_calendar_arrow:
+            # El primer clic solo propone la fecha de hoy; si siguiera, Qt la movería un día.
+            self._start_editing()
+            event.accept()
+            return
+        self._start_editing()
+        super().mousePressEvent(event)
+
+    def focusInEvent(self, event) -> None:
+        # Solo cuando el usuario llega a propósito (Tab): el foco inicial de la ventana no debe poner fecha.
+        if event.reason() in (Qt.FocusReason.TabFocusReason, Qt.FocusReason.BacktabFocusReason):
+            self._start_editing()
+        super().focusInEvent(event)
+
+
+class SelectAllSpinBox(QSpinBox):
+    """Al pulsarla se selecciona el número entero, para escribir el nuevo directamente."""
+
+    def focusInEvent(self, event) -> None:
+        super().focusInEvent(event)
+        QTimer.singleShot(0, self.selectAll)
+
+    def mousePressEvent(self, event) -> None:
+        super().mousePressEvent(event)
+        if not self.lineEdit().hasSelectedText():
+            QTimer.singleShot(0, self.selectAll)
+
+
+def letter_avatar(name: str, size: int) -> QPixmap:
+    """Círculo de color con la inicial, como YouTube cuando un canal no tiene foto."""
+    from PySide6.QtGui import QColor, QFont
+
+    pixmap = hidpi_canvas(size, size)
+    hue = sum(map(ord, name)) * 37 % 360
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor.fromHsl(hue, 120, 110))
+    painter.drawEllipse(0, 0, size, size)
+    painter.setPen(QColor("white"))
+    font = QFont()
+    font.setPixelSize(int(size * 0.5))
+    font.setBold(True)
+    painter.setFont(font)
+    painter.drawText(QRect(0, 0, size, size), Qt.AlignmentFlag.AlignCenter, (name.strip()[:1] or "?").upper())
+    painter.end()
+    return pixmap
+
+
+def channel_avatar(catalog: Catalog, name: str, size: int) -> QPixmap:
+    avatar = catalog.channel(name)["avatar"]
+    source = QPixmap(avatar) if avatar else QPixmap()
+    return round_avatar(source, size) if not source.isNull() else letter_avatar(name, size)
+
+
 class ChannelDialog(QDialog):
     """Datos de un canal. Solo se guardan en el catálogo; los vídeos no cambian."""
 
@@ -347,25 +430,24 @@ class ChannelDialog(QDialog):
         photo.addLayout(photo_buttons)
         photo.addStretch()
 
-        self.created_known = QCheckBox("Conozco la fecha")
-        self.created = QDateEdit(calendarPopup=True)
-        self.created.setDisplayFormat("dd/MM/yyyy")
-        self.created.setMaximumDate(QDate.currentDate())
+        self.created = OptionalDateEdit()
         date = QDate.fromString(info["created"], "yyyy-MM-dd")
-        self.created_known.setChecked(date.isValid())
-        self.created.setDate(date if date.isValid() else QDate(2015, 1, 1))
-        self.created.setEnabled(date.isValid())
-        self.created_known.toggled.connect(self.created.setEnabled)
+        if date.isValid():
+            self.created.setDate(date)
+        clear_date = QPushButton("✕")
+        clear_date.setToolTip("Dejar sin fecha")
+        clear_date.setFixedWidth(32)
+        clear_date.clicked.connect(self.created.clear_date)
         created_row = QHBoxLayout()
-        created_row.addWidget(self.created_known)
         created_row.addWidget(self.created, 1)
+        created_row.addWidget(clear_date)
 
         self.country = QComboBox(editable=True)
         self.country.addItems(COUNTRIES)
         self.country.setCurrentText(info["country"])
         self.country.lineEdit().setPlaceholderText("Escribe o elige un país")
 
-        self.total = QSpinBox()
+        self.total = SelectAllSpinBox()
         self.total.setRange(0, 10_000_000)
         self.total.setSpecialValueText("Desconocida")
         self.total.setValue(info["total_videos"])
@@ -411,7 +493,7 @@ class ChannelDialog(QDialog):
                 avatar = str(dest)
         self.catalog.save_channel(
             self.name, avatar=avatar, country=self.country.currentText().strip(), total_videos=self.total.value(),
-            created=self.created.date().toString("yyyy-MM-dd") if self.created_known.isChecked() else "")
+            created="" if self.created.is_empty() else self.created.date().toString("yyyy-MM-dd"))
         self.accept()
 
 

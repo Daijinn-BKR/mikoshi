@@ -4,10 +4,10 @@ from __future__ import annotations
 import os
 import random
 
-from PySide6.QtCore import Qt, QUrl, Signal
+from PySide6.QtCore import QUrl, Signal
 from PySide6.QtGui import QPainter
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QMenu, QPushButton, QSlider, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QMenu, QPushButton, QVBoxLayout, QWidget
 
 from .db import display_title, effective, full_path
 from .player import SeekSlider, format_time
@@ -59,7 +59,7 @@ class NowPlayingBar(QWidget):
         self.position = SeekSlider()
         self.time_label = QLabel("0:00 / 0:00")
         self.time_label.setProperty("muted", True)
-        self.volume = QSlider(Qt.Orientation.Horizontal)
+        self.volume = SeekSlider()
         self.volume.setRange(0, 100)
         self.volume.setValue(80)
         self.volume.setFixedWidth(90)

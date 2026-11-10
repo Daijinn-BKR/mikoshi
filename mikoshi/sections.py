@@ -6,16 +6,17 @@ reproducir, el menú de un elemento y las tareas largas.
 from __future__ import annotations
 
 import os
+import random
 import re
 import zlib
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractTableModel, QDate, QModelIndex, QSize, Qt
-from PySide6.QtGui import QFont, QIcon, QPainter, QPixmap
+from PySide6.QtCore import QAbstractTableModel, QDate, QModelIndex, QPoint, QRect, QSize, Qt
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMenu, QMessageBox, QPushButton, QSplitter, QStackedWidget, QTableView,
+    QListWidgetItem, QMenu, QMessageBox, QPushButton, QSplitter, QStyle, QStyledItemDelegate, QStackedWidget, QTableView,
     QTextBrowser, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -23,7 +24,7 @@ from . import dialogs, online, thumbnails
 from .db import display_title, effective, full_path
 from .player import PlayerHooks, PlayerWidget
 from .widgets import (
-    LIVE_VIEWS, POSTER, SQUARE, WIDE, CardModel, card_view, clock, draw_cover, hidpi_canvas, human_size, number, open_path,
+    BADGE_ROLE, LIVE_VIEWS, POSTER, SQUARE, SUBTITLE_ROLE, WIDE, CardModel, card_view, clock, draw_cover, hidpi_canvas, human_size, number, open_path,
     reveal_path, seconds, stars, video_category, year, ago,
 )
 
@@ -76,6 +77,14 @@ class IconBinder:
         thumbs.updated.connect(self._updated)
         LIVE_VIEWS.add(self)
 
+    @staticmethod
+    def _apply(entry, image) -> None:
+        # Un QIcon se pinta como icono; un QPixmap lo pinta a medida un delegado propio.
+        if isinstance(image, QPixmap):
+            entry.setData(Qt.ItemDataRole.DecorationRole, image)
+        else:
+            entry.setIcon(image)
+
     def update_item(self, fresh: dict) -> None:
         """El elemento cambió (por ejemplo, su portada): las filas lo usan ya actualizado."""
         entries = self.entries.get(fresh["id"], [])
@@ -87,12 +96,58 @@ class IconBinder:
             self.entries[item_id] = [e for e in self.entries[item_id] if e[0] is not owner]
 
     def bind(self, owner, entry, item: dict, make=QIcon) -> None:
-        entry.setIcon(make(self.thumbs.get(item)))
+        self._apply(entry, make(self.thumbs.get(item)))
         self.entries[item["id"]].append((owner, entry, item, make))
 
     def _updated(self, item_id: int) -> None:
         for _owner, entry, item, make in self.entries.get(item_id, []):
-            entry.setIcon(make(self.thumbs.get(item)))
+            self._apply(entry, make(self.thumbs.get(item)))
+
+
+class UpNextDelegate(QStyledItemDelegate):
+    """Fila de «A continuación» como en YouTube: miniatura 16:9 a la izquierda; título, canal y duración."""
+    THUMB = QSize(168, 94)
+
+    def sizeHint(self, option, index):
+        return QSize(option.rect.width(), self.THUMB.height() + 10)
+
+    def paint(self, painter, option, index):
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = option.rect
+        if option.state & QStyle.StateFlag.State_MouseOver:
+            painter.fillRect(rect, option.palette.alternateBase())
+        thumb = QRect(rect.x() + 4, rect.y() + 5, self.THUMB.width(), self.THUMB.height())
+        pixmap = index.data(Qt.ItemDataRole.DecorationRole)
+        if isinstance(pixmap, QPixmap):
+            draw_cover(painter, pixmap, thumb, 6)
+        badge = index.data(BADGE_ROLE)
+        if badge:
+            metrics = painter.fontMetrics()
+            box = QRect(0, 0, metrics.horizontalAdvance(badge) + 8, 18)
+            box.moveBottomRight(thumb.bottomRight() - QPoint(4, 4))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 190))
+            painter.drawRoundedRect(box, 3, 3)
+            painter.setPen(QColor("white"))
+            painter.drawText(box, Qt.AlignmentFlag.AlignCenter, badge)
+        text = QRect(thumb.right() + 10, thumb.top(), rect.right() - thumb.right() - 14, thumb.height())
+        title_font = QFont(option.font)
+        title_font.setWeight(QFont.Weight.DemiBold)
+        painter.setFont(title_font)
+        painter.setPen(option.palette.text().color())
+        metrics = painter.fontMetrics()
+        # Dos líneas como máximo, cortadas con «…», para que todas las filas midan lo mismo.
+        title = metrics.elidedText(index.data() or "", Qt.TextElideMode.ElideRight, text.width() * 2 - 12)
+        flags = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap
+        used = painter.boundingRect(QRect(text.x(), text.y(), text.width(), metrics.height() * 2 + 2), flags, title)
+        painter.drawText(QRect(text.x(), text.y(), text.width(), metrics.height() * 2 + 2), flags, title)
+        subtitle = index.data(SUBTITLE_ROLE) or ""
+        painter.setFont(option.font)
+        painter.setPen(option.palette.placeholderText().color())
+        line = QRect(text.x(), used.bottom() + 4, text.width(), painter.fontMetrics().height() * 2)
+        painter.drawText(line, flags, subtitle)
+        painter.restore()
 
 
 class Section(QWidget):
@@ -1258,6 +1313,8 @@ class FavoritesSection(Section):
         self.channels_grid = card_view(self.channels_model, 180, SQUARE)
         self.channels_grid.clicked.connect(
             lambda index: self.show_channel(self.channels_model.items[index.row()]["name"]))
+        self.channels_grid.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.channels_grid.customContextMenuRequested.connect(self._channel_card_menu)
         layout = QVBoxLayout()
         layout.addLayout(top)
         layout.addWidget(self.channels_grid, 1)
@@ -1333,11 +1390,25 @@ class FavoritesSection(Section):
         self.pages.setCurrentWidget(self.channel_page)
 
     def _edit_channel(self) -> None:
-        if not self.current_channel:
-            return
-        dialog = dialogs.ChannelDialog(self.catalog, self.current_channel, len(self.channel_model.items), self)
-        if dialog.exec() == dialogs.QDialog.DialogCode.Accepted:
+        if self.current_channel and self.edit_channel(self.current_channel):
             self.show_channel(self.current_channel)
+
+    def edit_channel(self, name: str) -> bool:
+        videos = len(self.channels().get(name, []))
+        dialog = dialogs.ChannelDialog(self.catalog, name, videos, self)
+        return dialog.exec() == dialogs.QDialog.DialogCode.Accepted
+
+    def channel_menu(self, name: str) -> QMenu:
+        menu = QMenu(self)
+        menu.addAction("Ver canal", lambda: self.show_channel(name))
+        menu.addAction("Editar canal…", lambda: self.edit_channel(name) and self.show_channels())
+        return menu
+
+    def _channel_card_menu(self, position) -> None:
+        index = self.channels_grid.indexAt(position)
+        if index.isValid():
+            name = self.channels_model.items[index.row()]["name"]
+            self.channel_menu(name).exec(self.channels_grid.viewport().mapToGlobal(position))
 
     def _channel_cover(self, channel: dict) -> dict:
         """Lo que se pinta en la tarjeta del canal: su foto si la tiene; si no, su primer vídeo."""
@@ -1413,6 +1484,7 @@ class FavoritesSection(Section):
         self.watch_description = muted()
         self.channel_button = QPushButton()
         self.channel_button.setProperty("chip", True)
+        self.channel_button.setIconSize(QSize(28, 28))
         self.channel_button.setToolTip("Ver todos los videos de este autor")
         back = QPushButton("← Volver")
         edit = QPushButton("Editar metadatos…")
@@ -1433,11 +1505,21 @@ class FavoritesSection(Section):
         left.addWidget(self.watch_meta)
         left.addWidget(self.watch_description)
         self.up_next = QListWidget()
-        self.up_next.setIconSize(QSize(168, 94))
-        self.up_next.setFixedWidth(400)
-        self.up_next.setWordWrap(True)
+        self.up_next.setItemDelegate(UpNextDelegate(self.up_next))
+        self.up_next.setFixedWidth(420)
+        self.up_next.setMouseTracking(True)
+        self.up_next.setUniformItemSizes(True)
+        self.up_next.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.shuffle_button = QPushButton("Aleatorio")
+        self.shuffle_button.setProperty("chip", True)
+        self.shuffle_button.setToolTip("Mezclar otra vez los videos que vienen después")
+        self.shuffle_button.clicked.connect(self.reshuffle)
+        up_next_title = QHBoxLayout()
+        up_next_title.addWidget(QLabel("A continuación"))
+        up_next_title.addStretch()
+        up_next_title.addWidget(self.shuffle_button)
         right = QVBoxLayout()
-        right.addWidget(QLabel("A continuación"))
+        right.addLayout(up_next_title)
         right.addWidget(self.up_next, 1)
         row = QHBoxLayout()
         row.addLayout(left, 1)
@@ -1547,14 +1629,40 @@ class FavoritesSection(Section):
         self.watch_meta.setText(" · ".join(p for p in (f"{plays} reproducciones", ago(item["added_at"]),
                                                        clock(seconds(item)), human_size(item["size"])) if p))
         self.watch_description.setText(meta.get("description", ""))
-        self.channel_button.setText(self.channel_of(item))
+        channel = self.channel_of(item)
+        self.channel_button.setText(channel)
+        self.channel_button.setIcon(QIcon(dialogs.channel_avatar(self.catalog, channel, 28)))
+        self.fill_up_next()
+
+    def fill_up_next(self) -> None:
         self.icons.clear(self.up_next)
         self.up_next.clear()
+        activity = self.catalog.activity()
         for offset, video in enumerate(self.player.items[self.player.index + 1:self.player.index + 30], 1):
-            entry = QListWidgetItem(f"{display_title(video)}\n{clock(seconds(video))}")
-            self.icons.bind(self.up_next, entry, video, lambda p: QIcon(cover_pixmap(p, 168, 94)))
+            plays = activity.get(video["id"], {}).get("play_count", 0)
+            entry = QListWidgetItem(display_title(video))
+            entry.setData(SUBTITLE_ROLE, f"{self.channel_of(video)}\n{plays} reproducciones · {ago(video['added_at'])}")
+            entry.setData(BADGE_ROLE, clock(seconds(video)))
             entry.setData(Qt.ItemDataRole.UserRole, offset)
+            entry.setToolTip(display_title(video))
+            self.icons.bind(self.up_next, entry, video, lambda p: p)
             self.up_next.addItem(entry)
+
+    def reshuffle(self) -> None:
+        """Cada pulsación vuelve a mezclar lo que viene después del vídeo actual, siempre en otro orden."""
+        player = self.player
+        if not player.items:
+            return
+        done, rest = player.items[:player.index + 1], player.items[player.index + 1:]
+        before = [video["id"] for video in rest]
+        if len(rest) > 1:
+            for _attempt in range(20):
+                random.shuffle(rest)
+                if [video["id"] for video in rest] != before:
+                    break
+        player.items = done + rest
+        player.next_button.setEnabled(player.index < len(player.items) - 1)
+        self.fill_up_next()
 
     def _edit_playing(self) -> None:
         if self.player.items:
