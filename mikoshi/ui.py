@@ -1677,6 +1677,7 @@ class MainWindow(QMainWindow):
             self.worker.requestInterruption()
             self.worker.wait()
         for section in self.sections:
+            section.close_windows()
             section.leave()
         self.now_playing.stop()
         self.thumbs.shutdown()

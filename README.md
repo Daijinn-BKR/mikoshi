@@ -36,7 +36,9 @@ Mikoshi se organiza en pestañas, cada una con su propio diseño:
   aleatorio y repetición que sigue sonando mientras navegas.
 - **Videos favoritos** (al estilo de YouTube): cuadrícula 16:9 con duración,
   página de reproducción con «A continuación» y pantalla completa (doble clic,
-  F o F11; Esc para salir), y canales por autor. Una reproducción cuenta al ver
+  F o F11; Esc para salir), minirreproductor flotante siempre visible (botón
+  de la ventanita o I; se mueve arrastrando el vídeo y se estira por los
+  bordes), y canales por autor. Una reproducción cuenta al ver
   el 95 % del vídeo, y al volver a uno sin terminar pregunta si continuar o
   empezar de nuevo. Clic derecho en un vídeo para editar, ver su canal o marcarlo
   como visto. Usa la carpeta marcada como de favoritos; si una sola carpeta se

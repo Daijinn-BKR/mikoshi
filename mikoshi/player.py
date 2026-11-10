@@ -68,6 +68,19 @@ def _draw_icon(name: str, color: QColor) -> QPixmap:
     elif name == "previous":
         triangle((36, 12), (36, 36), (17, 24))
         painter.drawRect(QRectF(12, 12, 4, 24))
+    elif name in ("miniplayer", "close"):
+        pen = QPen(color, 3.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if name == "close":
+            painter.drawLine(QPointF(14, 14), QPointF(34, 34))
+            painter.drawLine(QPointF(34, 14), QPointF(14, 34))
+        else:
+            # Como en YouTube: la pantalla con una ventanita en la esquina.
+            painter.drawRoundedRect(QRectF(8, 11, 32, 26), 2, 2)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            painter.drawRect(QRectF(23, 24, 13, 9))
     else:
         # Esquinas hacia fuera para entrar en pantalla completa; hacia dentro para salir.
         pen = QPen(color, 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.SquareCap, Qt.PenJoinStyle.MiterJoin)
@@ -190,15 +203,35 @@ class VideoView(QGraphicsView):
         self._fit()
 
     def mouseDoubleClickEvent(self, event) -> None:
-        self.owner.toggle_fullscreen()
+        if self.owner.mini_window:
+            self.owner.expand_mini()
+        else:
+            self.owner.toggle_fullscreen()
 
     def mousePressEvent(self, event) -> None:
         self.setFocus()
         self.owner.poke()
+        self.press_position = event.position()
+
+    def mouseMoveEvent(self, event) -> None:
+        # En el minirreproductor, arrastrar el vídeo mueve la ventana.
+        press = getattr(self, "press_position", None)
+        if (self.owner.mini_window and press is not None and event.buttons() & Qt.MouseButton.LeftButton
+                and (event.position() - press).manhattanLength() > 4):
+            self.press_position = None
+            self.window().windowHandle().startSystemMove()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self.press_position = None
+        super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
-        if key in (Qt.Key.Key_F, Qt.Key.Key_F11) or (key == Qt.Key.Key_Escape and self.owner.immersive):
+        if key == Qt.Key.Key_I:
+            self.owner.toggle_mini()
+        elif key in (Qt.Key.Key_F, Qt.Key.Key_F11) or (key == Qt.Key.Key_Escape and self.owner.immersive):
             self.owner.toggle_fullscreen()
         elif key == Qt.Key.Key_Space:
             self.owner.toggle()
@@ -209,8 +242,80 @@ class VideoView(QGraphicsView):
             super().keyPressEvent(event)
 
 
+class MiniWindow(QWidget):
+    """Ventanita flotante, siempre encima, para seguir viendo el vídeo con Mikoshi minimizado.
+
+    No tiene marco: el vídeo se arrastra para moverla y los bordes se estiran para cambiar su tamaño.
+    """
+    BORDER = 5
+    last_geometry = None
+
+    def __init__(self, player: "PlayerWidget"):
+        super().__init__(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.WindowStaysOnTopHint)
+        self.player = player
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setStyleSheet("MiniWindow { background: #202020; }")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        self.setMinimumSize(300, 180)
+        self.setMouseTracking(True)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(*[self.BORDER] * 4)
+        layout.addWidget(player)
+        if MiniWindow.last_geometry is not None:
+            self.setGeometry(MiniWindow.last_geometry)
+        else:
+            # Como en YouTube: abajo a la derecha de la pantalla donde está Mikoshi.
+            screen = (QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()).availableGeometry()
+            self.resize(480 + 2 * self.BORDER, 270 + 2 * self.BORDER)
+            self.move(screen.right() - self.width() - 24, screen.bottom() - self.height() - 24)
+
+    def _edges(self, position) -> Qt.Edge:
+        x, y, border = position.x(), position.y(), self.BORDER + 2
+        edges = Qt.Edge(0)
+        if x <= border:
+            edges |= Qt.Edge.LeftEdge
+        elif x >= self.width() - border:
+            edges |= Qt.Edge.RightEdge
+        if y <= border:
+            edges |= Qt.Edge.TopEdge
+        elif y >= self.height() - border:
+            edges |= Qt.Edge.BottomEdge
+        return edges
+
+    def mouseMoveEvent(self, event) -> None:
+        edges = self._edges(event.position())
+        horizontal = bool(edges & (Qt.Edge.LeftEdge | Qt.Edge.RightEdge))
+        vertical = bool(edges & (Qt.Edge.TopEdge | Qt.Edge.BottomEdge))
+        if horizontal and vertical:
+            falling = edges in (Qt.Edge.LeftEdge | Qt.Edge.TopEdge, Qt.Edge.RightEdge | Qt.Edge.BottomEdge)
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor if falling else Qt.CursorShape.SizeBDiagCursor)
+        elif horizontal:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif vertical:
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+        else:
+            self.unsetCursor()
+
+    def mousePressEvent(self, event) -> None:
+        edges = self._edges(event.position())
+        if event.button() == Qt.MouseButton.LeftButton and edges:
+            self.windowHandle().startSystemResize(edges)
+        elif event.button() == Qt.MouseButton.LeftButton:
+            self.windowHandle().startSystemMove()
+
+    def closeEvent(self, event) -> None:
+        MiniWindow.last_geometry = self.geometry()
+        if self.player.mini_window is self:
+            # Cerrada con Alt+F4: es lo mismo que pulsar ✕.
+            self.player.close_mini()
+        super().closeEvent(event)
+
+
 class PlayerWidget(QWidget):
     item_changed = Signal(dict)
+    # El usuario pidió volver del minirreproductor a la página del vídeo.
+    expand_requested = Signal()
 
     def __init__(self, items: list[dict], index: int, open_external, hooks: PlayerHooks | None = None, parent=None):
         super().__init__(parent)
@@ -225,6 +330,10 @@ class PlayerWidget(QWidget):
         self.hidden_for_fullscreen: list[QWidget] = []
         self.saved_margins: list = []
         self.saved_window_state = None
+        # El minirreproductor solo se ofrece donde la página sabe recuperar el vídeo (Videos favoritos).
+        self.allow_mini = False
+        self.mini_window: MiniWindow | None = None
+        self.mini_home = None
 
         self.video = VideoView(self)
         self.picture = QLabel(alignment=Qt.AlignmentFlag.AlignCenter)
@@ -241,13 +350,17 @@ class PlayerWidget(QWidget):
         self.player.setVideoOutput(self.video.item)
 
         self.icons = {name: player_icon(name)
-                      for name in ("play", "pause", "previous", "next", "fullscreen", "exit_fullscreen")}
+                      for name in ("play", "pause", "previous", "next", "fullscreen", "exit_fullscreen",
+                                   "miniplayer", "close")}
         self.previous_button = QPushButton(toolTip="Vídeo anterior")
         self.play_button = QPushButton(toolTip="Pausa (Espacio)")
         self.next_button = QPushButton(toolTip="Siguiente vídeo")
         self.fullscreen_button = QPushButton(toolTip="Pantalla completa (F o doble clic)")
+        self.mini_button = QPushButton(toolTip="Minirreproductor (I)")
+        self.close_mini_button = QPushButton(toolTip="Cerrar el minirreproductor")
         for button, icon in ((self.previous_button, "previous"), (self.play_button, "pause"),
-                             (self.next_button, "next"), (self.fullscreen_button, "fullscreen")):
+                             (self.next_button, "next"), (self.fullscreen_button, "fullscreen"),
+                             (self.mini_button, "miniplayer"), (self.close_mini_button, "close")):
             button.setIcon(self.icons[icon])
             button.setIconSize(QSize(28, 28))
             button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -270,9 +383,13 @@ class PlayerWidget(QWidget):
         for widget in (self.previous_button, self.play_button, self.next_button, self.time_label):
             buttons.addWidget(widget)
         buttons.addStretch()
-        buttons.addWidget(QLabel("Vol."))
+        self.volume_label = QLabel("Vol.")
+        buttons.addWidget(self.volume_label)
         buttons.addWidget(self.volume)
+        buttons.addWidget(self.mini_button)
         buttons.addWidget(self.fullscreen_button)
+        buttons.addWidget(self.close_mini_button)
+        self.close_mini_button.hide()
         overlay = QVBoxLayout(self.controls)
         overlay.setContentsMargins(12, 24, 12, 6)
         overlay.setSpacing(2)
@@ -293,6 +410,8 @@ class PlayerWidget(QWidget):
         self.next_button.clicked.connect(lambda: self.go(1))
         self.play_button.clicked.connect(self.toggle)
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
+        self.mini_button.clicked.connect(self.toggle_mini)
+        self.close_mini_button.clicked.connect(self.close_mini)
         self.volume.valueChanged.connect(lambda value: self.audio.setVolume(value / 100))
         self.position.sliderPressed.connect(lambda: setattr(self, "seeking", True))
         self.position.sliderReleased.connect(self._seek)
@@ -384,7 +503,7 @@ class PlayerWidget(QWidget):
         is_media = kind in ("video", "audio")
         for widget in (self.play_button, self.position, self.volume, self.time_label):
             widget.setVisible(is_media)
-        self.fullscreen_button.setVisible(kind == "video")
+        self._update_mode_buttons()
         self.counted = False
         self.position.setValue(0)
         if not os.path.exists(path):
@@ -458,8 +577,83 @@ class PlayerWidget(QWidget):
         """
         if self.immersive:
             self._leave_fullscreen()
-        elif self.items and self.item["kind"] == "video":
+        elif self.items and self.item["kind"] == "video" and not self.mini_window:
             self._enter_fullscreen()
+
+    # Minirreproductor
+
+    def _update_mode_buttons(self) -> None:
+        video = bool(self.items) and self.item["kind"] == "video"
+        mini = self.mini_window is not None
+        if mini and self.items:
+            self.mini_window.setWindowTitle(f"{display_title(self.item)} · Mikoshi")
+        self.fullscreen_button.setVisible(video and not mini)
+        # En la ventanita, el mismo botón la devuelve a Mikoshi.
+        self.mini_button.setVisible(video and self.allow_mini)
+        self.mini_button.setToolTip("Volver a Mikoshi (I o doble clic)" if mini else "Minirreproductor (I)")
+        self.close_mini_button.setVisible(mini)
+        # En la ventanita no cabe todo: el volumen se queda, sin la palabra «Vol.».
+        self.volume_label.setVisible(not mini)
+        self.volume.setFixedWidth(70 if mini else 100)
+
+    def toggle_mini(self) -> None:
+        if self.mini_window:
+            self.expand_mini()
+        elif self.allow_mini and self.items and self.item["kind"] == "video":
+            self.enter_mini()
+
+    def enter_mini(self) -> None:
+        """Pasa el reproductor a una ventanita flotante. En la página queda un aviso en su lugar."""
+        if self.mini_window or self.parentWidget() is None or self.parentWidget().layout() is None:
+            return
+        if self.immersive:
+            self._leave_fullscreen()
+        layout = self.parentWidget().layout()
+        placeholder = QWidget()
+        placeholder.setObjectName("miniplaceholder")
+        placeholder.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        placeholder.setStyleSheet("#miniplaceholder { background: black; } QLabel { color: white; }")
+        text = QLabel("Se está reproduciendo en el minirreproductor", alignment=Qt.AlignmentFlag.AlignCenter)
+        back = QPushButton("Traer aquí")
+        back.clicked.connect(self.leave_mini)
+        column = QVBoxLayout(placeholder)
+        column.addStretch()
+        column.addWidget(text)
+        column.addWidget(back, 0, Qt.AlignmentFlag.AlignHCenter)
+        column.addStretch()
+        layout.replaceWidget(self, placeholder)
+        self.mini_home = (layout, placeholder)
+        self.mini_window = MiniWindow(self)
+        self._update_mode_buttons()
+        self.show()
+        self.mini_window.show()
+        self.poke()
+
+    def leave_mini(self) -> None:
+        """Devuelve el reproductor a su página, sin parar el vídeo."""
+        window = self.mini_window
+        if not window:
+            return
+        self.mini_window = None
+        layout, placeholder = self.mini_home
+        self.mini_home = None
+        layout.replaceWidget(placeholder, self)
+        placeholder.deleteLater()
+        self.show()
+        window.close()
+        self._update_mode_buttons()
+        self.poke()
+
+    def expand_mini(self) -> None:
+        self.leave_mini()
+        self.expand_requested.emit()
+
+    def close_mini(self) -> None:
+        """✕ del minirreproductor: el vídeo se pausa y vuelve a su página, como al cerrarlo en YouTube."""
+        if self.mini_window:
+            self.player.pause()
+            self.save_progress()
+            self.leave_mini()
 
     def _enter_fullscreen(self) -> None:
         window = self.window()

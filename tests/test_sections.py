@@ -733,7 +733,7 @@ def test_player_uses_icons_and_has_no_open_outside_button(window):
     from PySide6.QtWidgets import QPushButton as Button
 
     texts = [b.text() for b in player.controls.findChildren(Button)]
-    assert texts == ["", "", "", ""], texts
+    assert texts and all(text == "" for text in texts), texts
     assert not any("Abrir fuera" in b.toolTip() for b in player.controls.findChildren(Button))
     key = lambda name: player.icons[name].pixmap(28, 28).toImage()
     assert len({key(n).cacheKey() for n in player.icons}) == len(player.icons)
@@ -1029,3 +1029,72 @@ def test_channel_button_shows_profile_photo(window, tmp_path):
     assert center.red() > 200 and center.green() < 60
     window.catalog.save_channel("Sin autor", avatar="")
     favorites._back()
+
+
+def test_miniplayer_floats_and_comes_back(window):
+    from mikoshi.player import MiniWindow
+
+    favorites = favorites_with_root(window)
+    videos = list(favorites.model.items)
+    favorites.watch(videos, 0)
+    player = favorites.player
+    assert player.mini_button.isVisibleTo(player)
+    player.mini_button.click()
+    mini = player.mini_window
+    assert isinstance(mini, MiniWindow) and mini.isVisible()
+    assert player.window() is mini
+    assert mini.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
+    assert player.mini_button.isVisibleTo(player) and not player.fullscreen_button.isVisibleTo(player)
+    assert "Volver" in player.mini_button.toolTip()
+    assert player.close_mini_button.isVisibleTo(player)
+    # Navegar por Mikoshi no detiene el vídeo del minirreproductor.
+    favorites._back()
+    window.tabs.setCurrentIndex(0)
+    assert player.mini_window is mini and player.items[0]["id"] == videos[0]["id"]
+    # Ampliar: vuelve a la página del vídeo dentro de Mikoshi.
+    player.expand_mini()
+    assert player.mini_window is None and player.window() is window
+    assert window.tabs.currentWidget() is favorites and favorites.pages.currentWidget() is favorites.watch_page
+    assert player.mini_button.isVisibleTo(player)
+    # ✕ lo cierra, pausa y deja el vídeo en su página.
+    player.toggle_mini()
+    player.close_mini_button.click()
+    assert player.mini_window is None and player.window() is window
+    assert player.player.playbackState() != player.player.PlaybackState.PlayingState
+    # Elegir otro vídeo con el minirreproductor abierto lo trae de vuelta.
+    player.toggle_mini()
+    favorites.watch(videos, 1)
+    assert player.mini_window is None and player.item["id"] == videos[1]["id"]
+    favorites._back()
+
+
+def test_miniplayer_closes_with_mikoshi(app, library, tmp_path):
+    from mikoshi.ui import MainWindow
+
+    win = MainWindow(tmp_path / "m.db")
+    win.catalog.add_root(str(library / "favoritos"))
+    win.scan_all()
+    wait_until(lambda: win.worker is None, 60000)
+    win.show()
+    favorites = section(win, "Videos favoritos")
+    favorites.refresh()
+    favorites.watch(favorites.model.items, 0)
+    favorites.player.toggle_mini()
+    mini = favorites.player.mini_window
+    assert mini is not None
+    win.close()
+    assert favorites.player.mini_window is None and not mini.isVisible()
+
+
+def test_mini_window_resizes_from_its_edges(app):
+    from PySide6.QtCore import QPointF
+    from mikoshi.player import MiniWindow, PlayerWidget
+
+    player = PlayerWidget([], 0, None)
+    player.mini_window = None
+    mini = MiniWindow(player)
+    mini.resize(400, 240)
+    assert mini._edges(QPointF(2, 120)) == Qt.Edge.LeftEdge
+    assert mini._edges(QPointF(398, 238)) == Qt.Edge.RightEdge | Qt.Edge.BottomEdge
+    assert mini._edges(QPointF(200, 120)) == Qt.Edge(0)
+    mini.deleteLater()

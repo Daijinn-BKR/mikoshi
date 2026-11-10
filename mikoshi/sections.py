@@ -170,6 +170,9 @@ class Section(QWidget):
         """Suelta los archivos de `paths` que la sección tenga abiertos."""
         return False
 
+    def close_windows(self) -> None:
+        """Al cerrar Mikoshi: cierra las ventanas propias que sigan abiertas, como el minirreproductor."""
+
     def edit(self, item: dict) -> None:
         self.main.edit_item(item["id"])
         self.refresh()
@@ -1363,7 +1366,8 @@ class FavoritesSection(Section):
         self.pages.setCurrentWidget(self.channels_page)
 
     def show_channel(self, name: str) -> None:
-        if self.pages.currentWidget() is self.watch_page:
+        # Con el minirreproductor abierto, el vídeo sigue mientras se navega.
+        if self.pages.currentWidget() is self.watch_page and not self.player.mini_window:
             self.player.stop()
         self.current_channel = name
         videos = self.channels().get(name, [])
@@ -1477,7 +1481,9 @@ class FavoritesSection(Section):
 
     def _build_watch_page(self) -> QWidget:
         self.player = PlayerWidget([], 0, open_path, None)
+        self.player.allow_mini = True
         self.player.item_changed.connect(self._show_info)
+        self.player.expand_requested.connect(self._show_watch_page)
         self.watch_title = heading("")
         self.watch_title.setWordWrap(True)
         self.watch_meta = muted()
@@ -1612,6 +1618,8 @@ class FavoritesSection(Section):
         self.model.set_items(self.sorted_videos())
 
     def watch(self, items: list[dict], index: int, resume: bool = True) -> None:
+        # Como en YouTube: elegir otro vídeo con el minirreproductor abierto lo trae de vuelta a la página.
+        self.player.leave_mini()
         self.main.now_playing.pause()
         # Como en YouTube: una reproducción cuenta al ver el 95 % del vídeo, no al abrirlo.
         self.player.hooks = PlayerHooks(self.catalog, resume=resume, count_at=0.95, ask_resume=self.ask_resume)
@@ -1669,8 +1677,21 @@ class FavoritesSection(Section):
             self.player.player.pause()
             self.main.edit_item(self.player.item["id"])
 
+    def _show_watch_page(self) -> None:
+        """Vuelta desde el minirreproductor: Mikoshi se muestra con el vídeo en su página."""
+        self.main.tabs.setCurrentWidget(self)
+        if self.pages.currentWidget() is not self.watch_page:
+            self.return_page = self.pages.currentWidget()
+            self.pages.setCurrentWidget(self.watch_page)
+        window = self.window()
+        if window.isMinimized():
+            window.showNormal()
+        window.raise_()
+        window.activateWindow()
+
     def _back(self) -> None:
-        self.player.stop()
+        if not self.player.mini_window:
+            self.player.stop()
         self.refresh()
         if self.return_page is self.channel_page and self.current_channel:
             self.show_channel(self.current_channel)
@@ -1681,6 +1702,9 @@ class FavoritesSection(Section):
         return self.player.release(paths)
 
     def leave(self) -> None:
-        if self.pages.currentWidget() is self.watch_page:
+        if self.pages.currentWidget() is self.watch_page and not self.player.mini_window:
             self.player.player.pause()
             self.player.save_progress()
+
+    def close_windows(self) -> None:
+        self.player.close_mini()
