@@ -14,6 +14,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QAbstractTableModel, QDate, QModelIndex, QPoint, QRect, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMenu, QMessageBox, QPushButton, QSplitter, QStyle, QStyledItemDelegate, QStackedWidget, QTableView,
@@ -22,7 +23,7 @@ from PySide6.QtWidgets import (
 
 from . import dialogs, online, thumbnails
 from .db import display_title, effective, full_path
-from .player import PlayerHooks, PlayerWidget
+from .player import PlayerHooks, PlayerWidget, format_time, star_pixmap
 from .widgets import (
     BADGE_ROLE, LIVE_VIEWS, POSTER, SQUARE, SUBTITLE_ROLE, WIDE, CardModel, card_view, clock, draw_cover, hidpi_canvas, human_size, number, open_path,
     reveal_path, seconds, stars, video_category, year, ago,
@@ -1482,8 +1483,10 @@ class FavoritesSection(Section):
     def _build_watch_page(self) -> QWidget:
         self.player = PlayerWidget([], 0, open_path, None)
         self.player.allow_mini = True
+        self.player.allow_bookmarks = True
         self.player.item_changed.connect(self._show_info)
         self.player.expand_requested.connect(self._show_watch_page)
+        self.player.bookmark_requested.connect(self.add_moment)
         self.watch_title = heading("")
         self.watch_title.setWordWrap(True)
         self.watch_meta = muted()
@@ -1495,12 +1498,17 @@ class FavoritesSection(Section):
         back = QPushButton("← Volver")
         edit = QPushButton("Editar metadatos…")
         folder = QPushButton("Ver en carpeta")
+        self.moment_button = QPushButton("Marcar momento")
+        self.moment_button.setIcon(QIcon(star_pixmap(18)))
+        self.moment_button.setToolTip("Guardar el momento actual como favorito (M)")
+        self.moment_button.clicked.connect(self.player.request_bookmark)
         top = QHBoxLayout()
         top.addWidget(back)
         top.addStretch()
         buttons = QHBoxLayout()
         buttons.addWidget(self.channel_button)
         buttons.addStretch()
+        buttons.addWidget(self.moment_button)
         buttons.addWidget(edit)
         buttons.addWidget(folder)
         left = QVBoxLayout()
@@ -1516,15 +1524,30 @@ class FavoritesSection(Section):
         self.up_next.setMouseTracking(True)
         self.up_next.setUniformItemSizes(True)
         self.up_next.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.up_next.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.shuffle_button = QPushButton("Aleatorio")
         self.shuffle_button.setProperty("chip", True)
-        self.shuffle_button.setToolTip("Mezclar otra vez los videos que vienen después")
+        self.shuffle_button.setToolTip("Mezclar todos los videos de la carpeta (cada clic, otro orden)")
         self.shuffle_button.clicked.connect(self.reshuffle)
         up_next_title = QHBoxLayout()
         up_next_title.addWidget(QLabel("A continuación"))
         up_next_title.addStretch()
         up_next_title.addWidget(self.shuffle_button)
+
+        # Momentos favoritos del vídeo, como los capítulos de YouTube: clic para ir a ese momento.
+        self.moments_title = QLabel()
+        self.moments = QListWidget()
+        self.moments.setFixedWidth(420)
+        self.moments.setIconSize(QSize(16, 16))
+        self.moments.hide()
+        self.moments.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.moments.customContextMenuRequested.connect(self._moment_menu)
+        self.moments.itemClicked.connect(lambda entry: self.player.seek_to(entry.data(Qt.ItemDataRole.UserRole)["position_ms"]))
+        self.moments.itemDoubleClicked.connect(lambda entry: self.edit_moment(entry.data(Qt.ItemDataRole.UserRole)))
         right = QVBoxLayout()
+        right.addWidget(self.moments_title)
+        right.addWidget(self.moments)
+        right.addSpacing(6)
         right.addLayout(up_next_title)
         right.addWidget(self.up_next, 1)
         row = QHBoxLayout()
@@ -1640,6 +1663,7 @@ class FavoritesSection(Section):
         channel = self.channel_of(item)
         self.channel_button.setText(channel)
         self.channel_button.setIcon(QIcon(dialogs.channel_avatar(self.catalog, channel, 28)))
+        self.fill_moments()
         self.fill_up_next()
 
     def fill_up_next(self) -> None:
@@ -1657,20 +1681,87 @@ class FavoritesSection(Section):
             self.up_next.addItem(entry)
 
     def reshuffle(self) -> None:
-        """Cada pulsación vuelve a mezclar lo que viene después del vídeo actual, siempre en otro orden."""
+        """Mezcla todos los videos de la carpeta detrás del actual. Cada pulsación da otro orden.
+
+        No solo lo que quedaba en la cola: aunque se empezara por uno de los últimos, entran todos.
+        """
         player = self.player
         if not player.items:
             return
-        done, rest = player.items[:player.index + 1], player.items[player.index + 1:]
-        before = [video["id"] for video in rest]
+        current = player.item
+        before = [video["id"] for video in player.items[player.index + 1:]]
+        rest = [video for video in self.videos if video["id"] != current["id"]]
         if len(rest) > 1:
             for _attempt in range(20):
                 random.shuffle(rest)
                 if [video["id"] for video in rest] != before:
                     break
-        player.items = done + rest
-        player.next_button.setEnabled(player.index < len(player.items) - 1)
+        # El vídeo actual sigue sonando: solo cambia lo que viene después.
+        player.items, player.index = [current] + rest, 0
+        player.previous_button.setEnabled(False)
+        player.next_button.setEnabled(bool(rest))
         self.fill_up_next()
+
+    # Momentos favoritos
+
+    def ask_note(self, title: str, label: str, text: str = "") -> str | None:
+        """Pide la nota de un momento. None si se cancela."""
+        from PySide6.QtWidgets import QInputDialog
+
+        note, ok = QInputDialog.getText(self, title, label, QLineEdit.EchoMode.Normal, text)
+        return note if ok else None
+
+    def add_moment(self, position_ms: int) -> None:
+        item = self.player.loaded_item
+        if not item:
+            return
+        playing = self.player.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        self.player.player.pause()
+        note = self.ask_note("Momento favorito", f"★ {format_time(position_ms)}\n¿Qué te gusta de esta parte? (opcional)")
+        if note is not None:
+            self.catalog.add_bookmark(item["id"], position_ms, note)
+            self.fill_moments()
+            self.main.status(f"Momento favorito guardado en {format_time(position_ms)}.")
+        if playing:
+            self.player.player.play()
+
+    def edit_moment(self, moment: dict) -> None:
+        note = self.ask_note("Editar momento favorito", f"★ {format_time(moment['position_ms'])}", moment["note"])
+        if note is not None:
+            self.catalog.update_bookmark(moment["id"], note)
+            self.fill_moments()
+
+    def delete_moment(self, moment: dict) -> None:
+        self.catalog.delete_bookmark(moment["id"])
+        self.fill_moments()
+
+    def _moment_menu(self, position) -> None:
+        entry = self.moments.itemAt(position)
+        if not entry:
+            return
+        moment = entry.data(Qt.ItemDataRole.UserRole)
+        menu = QMenu(self)
+        menu.addAction("Ir a este momento", lambda: self.player.seek_to(moment["position_ms"]))
+        menu.addAction("Editar nota…", lambda: self.edit_moment(moment))
+        menu.addAction("Borrar", lambda: self.delete_moment(moment))
+        menu.exec(self.moments.viewport().mapToGlobal(position))
+
+    def fill_moments(self) -> None:
+        self.moments.clear()
+        item = self.player.items and self.player.item
+        moments = self.catalog.bookmarks(item["id"]) if item and item["kind"] == "video" else []
+        icon = QIcon(star_pixmap(16))
+        for moment in moments:
+            entry = QListWidgetItem(icon, f"{format_time(moment['position_ms'])}   {moment['note'] or 'Sin nota'}")
+            entry.setData(Qt.ItemDataRole.UserRole, moment)
+            entry.setToolTip("Clic: ir a este momento · Doble clic: editar la nota · Clic derecho: más opciones")
+            self.moments.addItem(entry)
+        self.moments.setVisible(bool(moments))
+        if moments:
+            self.moments.setFixedHeight(min(170, len(moments) * self.moments.sizeHintForRow(0) + 6))
+        self.moments_title.setText(f"★ Momentos favoritos ({len(moments)})" if moments
+                                   else "★ Momentos favoritos: pulsa la estrella o M para guardar uno")
+        self.player.set_markers([(m["position_ms"], m["note"]) for m in moments])
 
     def _edit_playing(self) -> None:
         if self.player.items:

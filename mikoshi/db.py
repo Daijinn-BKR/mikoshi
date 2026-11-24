@@ -72,6 +72,14 @@ CREATE TABLE IF NOT EXISTS channels (
     country TEXT NOT NULL DEFAULT '',
     total_videos INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS bookmarks (
+    id INTEGER PRIMARY KEY,
+    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    position_ms INTEGER NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS bookmarks_item ON bookmarks(item_id, position_ms);
 CREATE TABLE IF NOT EXISTS activity (
     item_id INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
     play_count INTEGER NOT NULL DEFAULT 0,
@@ -342,6 +350,28 @@ class Catalog:
         self.conn.execute(
             "UPDATE activity SET watched = ?, position_ms = 0 WHERE item_id = ?", (int(watched), item_id)
         )
+        self.conn.commit()
+
+    # Momentos favoritos de un vídeo: sin límite, cada uno con su nota
+
+    def bookmarks(self, item_id: int) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM bookmarks WHERE item_id = ? ORDER BY position_ms, id", (item_id,))
+        return [dict(r) for r in rows]
+
+    def add_bookmark(self, item_id: int, position_ms: int, note: str = "") -> int:
+        cursor = self.conn.execute(
+            "INSERT INTO bookmarks (item_id, position_ms, note, created) VALUES (?, ?, ?, ?)",
+            (item_id, max(int(position_ms), 0), note.strip(), time.time()))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def update_bookmark(self, bookmark_id: int, note: str) -> None:
+        self.conn.execute("UPDATE bookmarks SET note = ? WHERE id = ?", (note.strip(), bookmark_id))
+        self.conn.commit()
+
+    def delete_bookmark(self, bookmark_id: int) -> None:
+        self.conn.execute("DELETE FROM bookmarks WHERE id = ?", (bookmark_id,))
         self.conn.commit()
 
     def query_items(self, kind=None, tag=None, root_id=None, status=None, text=None,

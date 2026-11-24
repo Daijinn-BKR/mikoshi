@@ -48,6 +48,37 @@ OVERLAY_STYLE = """
 """
 
 
+STAR_COLOR = QColor(255, 200, 61)
+
+
+def star_polygon(cx: float, cy: float, outer: float) -> QPolygonF:
+    """Estrella de cinco puntas centrada en (cx, cy)."""
+    import math
+
+    inner = outer * 0.45
+    points = []
+    for n in range(10):
+        radius = outer if n % 2 == 0 else inner
+        angle = math.radians(-90 + n * 36)
+        points.append(QPointF(cx + radius * math.cos(angle), cy + radius * math.sin(angle)))
+    return QPolygonF(points)
+
+
+def star_pixmap(size: int, color: QColor = STAR_COLOR) -> QPixmap:
+    """La estrella de los momentos favoritos, nítida en pantallas con escala."""
+    ratio = QApplication.instance().devicePixelRatio() if QApplication.instance() else 1.0
+    pixmap = QPixmap(round(size * ratio), round(size * ratio))
+    pixmap.setDevicePixelRatio(ratio)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(color)
+    painter.drawPolygon(star_polygon(size / 2, size / 2 + size * 0.04, size / 2))
+    painter.end()
+    return pixmap
+
+
 def _draw_icon(name: str, color: QColor) -> QPixmap:
     """Iconos del reproductor con las formas de YouTube, dibujados en una cuadrícula de 48 × 48."""
     pixmap = QPixmap(48, 48)
@@ -57,7 +88,9 @@ def _draw_icon(name: str, color: QColor) -> QPixmap:
     painter.setPen(Qt.PenStyle.NoPen)
     painter.setBrush(color)
     triangle = lambda *points: painter.drawPolygon(QPolygonF([QPointF(x, y) for x, y in points]))
-    if name == "play":
+    if name == "star":
+        painter.drawPolygon(star_polygon(24, 25, 17))
+    elif name == "play":
         triangle((15, 10), (15, 38), (38, 24))
     elif name == "pause":
         painter.drawRect(QRectF(13, 10, 8, 28))
@@ -150,24 +183,78 @@ class PlayerHooks:
 class SeekSlider(QSlider):
     """Barra de progreso o de volumen: un clic va justo a ese punto, como en YouTube, y se puede arrastrar."""
 
+    MARKER_SIZE = 14
+
     def __init__(self, parent=None):
         super().__init__(Qt.Orientation.Horizontal, parent)
+        # Momentos favoritos: (milisegundos, nota). Se pintan como estrellas sobre la barra.
+        self.markers: list[tuple[int, str]] = []
 
-    def value_at(self, x: float) -> int:
-        """Valor bajo el punto pulsado, contando con el ancho del asa para que el 25 % caiga en el 25 %."""
+    def _handle_width(self) -> int:
         from PySide6.QtWidgets import QStyleOptionSlider
 
         option = QStyleOptionSlider()
         self.initStyleOption(option)
-        handle = self.style().subControlRect(QStyle.ComplexControl.CC_Slider, option,
-                                             QStyle.SubControl.SC_SliderHandle, self).width()
+        return self.style().subControlRect(QStyle.ComplexControl.CC_Slider, option,
+                                           QStyle.SubControl.SC_SliderHandle, self).width()
+
+    def value_at(self, x: float) -> int:
+        """Valor bajo el punto pulsado, contando con el ancho del asa para que el 25 % caiga en el 25 %."""
+        handle = self._handle_width()
         span = max(1, self.width() - handle)
         return QStyle.sliderValueFromPosition(self.minimum(), self.maximum(),
                                               round(x - handle / 2), span)
 
+    def x_of(self, value: int) -> float:
+        """Centro del asa cuando la barra vale `value`: ahí va la estrella de ese momento."""
+        handle = self._handle_width()
+        span = max(1, self.width() - handle)
+        clamped = min(max(value, self.minimum()), self.maximum())
+        return QStyle.sliderPositionFromValue(self.minimum(), self.maximum(), clamped, span) + handle / 2
+
+    def set_markers(self, markers: list[tuple[int, str]]) -> None:
+        self.markers = list(markers)
+        self.setMinimumHeight(self.MARKER_SIZE + 4 if self.markers else 0)
+        self.update()
+
+    def marker_at(self, x: float) -> tuple[int, str] | None:
+        if self.maximum() <= self.minimum():
+            return None
+        near = [(abs(self.x_of(ms) - x), (ms, note)) for ms, note in self.markers]
+        near = [entry for entry in near if entry[0] <= self.MARKER_SIZE / 2 + 2]
+        return min(near)[1] if near else None
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if not self.markers or self.maximum() <= self.minimum():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor(0, 0, 0, 160), 1))
+        painter.setBrush(STAR_COLOR)
+        radius = self.MARKER_SIZE / 2
+        for ms, _note in self.markers:
+            painter.drawPolygon(star_polygon(self.x_of(ms), self.height() / 2, radius))
+        painter.end()
+
+    def event(self, event) -> bool:
+        if event.type() == QEvent.Type.ToolTip and self.markers:
+            from PySide6.QtWidgets import QToolTip
+
+            marker = self.marker_at(event.pos().x())
+            if marker:
+                ms, note = marker
+                QToolTip.showText(event.globalPos(), f"★ {format_time(ms)}" + (f" · {note}" if note else ""), self)
+            else:
+                QToolTip.hideText()
+            return True
+        return super().event(event)
+
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton and self.maximum() > self.minimum():
-            self.setValue(self.value_at(event.position().x()))
+            # Un clic sobre una estrella va justo a su momento, no al píxel pulsado.
+            marker = self.marker_at(event.position().x())
+            self.setValue(marker[0] if marker else self.value_at(event.position().x()))
         # El asa ya está bajo el cursor: el comportamiento normal permite seguir arrastrando.
         super().mousePressEvent(event)
 
@@ -231,6 +318,8 @@ class VideoView(QGraphicsView):
         key = event.key()
         if key == Qt.Key.Key_I:
             self.owner.toggle_mini()
+        elif key == Qt.Key.Key_M:
+            self.owner.request_bookmark()
         elif key in (Qt.Key.Key_F, Qt.Key.Key_F11) or (key == Qt.Key.Key_Escape and self.owner.immersive):
             self.owner.toggle_fullscreen()
         elif key == Qt.Key.Key_Space:
@@ -316,6 +405,8 @@ class PlayerWidget(QWidget):
     item_changed = Signal(dict)
     # El usuario pidió volver del minirreproductor a la página del vídeo.
     expand_requested = Signal()
+    # Se pulsó la estrella (o M): guardar un momento favorito en esta posición, en milisegundos.
+    bookmark_requested = Signal(int)
 
     def __init__(self, items: list[dict], index: int, open_external, hooks: PlayerHooks | None = None, parent=None):
         super().__init__(parent)
@@ -334,6 +425,8 @@ class PlayerWidget(QWidget):
         self.allow_mini = False
         self.mini_window: MiniWindow | None = None
         self.mini_home = None
+        # La estrella de momentos favoritos solo aparece donde la página los guarda (Videos favoritos).
+        self.allow_bookmarks = False
 
         self.video = VideoView(self)
         self.picture = QLabel(alignment=Qt.AlignmentFlag.AlignCenter)
@@ -352,15 +445,19 @@ class PlayerWidget(QWidget):
         self.icons = {name: player_icon(name)
                       for name in ("play", "pause", "previous", "next", "fullscreen", "exit_fullscreen",
                                    "miniplayer", "close")}
+        self.icons["star"] = QIcon(_draw_icon("star", STAR_COLOR))
         self.previous_button = QPushButton(toolTip="Vídeo anterior")
         self.play_button = QPushButton(toolTip="Pausa (Espacio)")
         self.next_button = QPushButton(toolTip="Siguiente vídeo")
         self.fullscreen_button = QPushButton(toolTip="Pantalla completa (F o doble clic)")
         self.mini_button = QPushButton(toolTip="Minirreproductor (I)")
         self.close_mini_button = QPushButton(toolTip="Cerrar el minirreproductor")
+        self.bookmark_button = QPushButton(toolTip="Marcar este momento como favorito (M)")
+        self.bookmark_button.hide()
         for button, icon in ((self.previous_button, "previous"), (self.play_button, "pause"),
                              (self.next_button, "next"), (self.fullscreen_button, "fullscreen"),
-                             (self.mini_button, "miniplayer"), (self.close_mini_button, "close")):
+                             (self.mini_button, "miniplayer"), (self.close_mini_button, "close"),
+                             (self.bookmark_button, "star")):
             button.setIcon(self.icons[icon])
             button.setIconSize(QSize(28, 28))
             button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -386,6 +483,7 @@ class PlayerWidget(QWidget):
         self.volume_label = QLabel("Vol.")
         buttons.addWidget(self.volume_label)
         buttons.addWidget(self.volume)
+        buttons.addWidget(self.bookmark_button)
         buttons.addWidget(self.mini_button)
         buttons.addWidget(self.fullscreen_button)
         buttons.addWidget(self.close_mini_button)
@@ -412,6 +510,7 @@ class PlayerWidget(QWidget):
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
         self.mini_button.clicked.connect(self.toggle_mini)
         self.close_mini_button.clicked.connect(self.close_mini)
+        self.bookmark_button.clicked.connect(self.request_bookmark)
         self.volume.valueChanged.connect(lambda value: self.audio.setVolume(value / 100))
         self.position.sliderPressed.connect(lambda: setattr(self, "seeking", True))
         self.position.sliderReleased.connect(self._seek)
@@ -423,6 +522,7 @@ class PlayerWidget(QWidget):
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, self.toggle)
         QShortcut(QKeySequence(Qt.Key.Key_F), self, self.toggle_fullscreen)
         QShortcut(QKeySequence(Qt.Key.Key_F11), self, self.toggle_fullscreen)
+        QShortcut(QKeySequence(Qt.Key.Key_M), self, self.request_bookmark)
         QShortcut(QKeySequence(Qt.Key.Key_Escape), self, lambda: self.immersive and self.toggle_fullscreen())
         if items:
             self.load()
@@ -503,6 +603,7 @@ class PlayerWidget(QWidget):
         is_media = kind in ("video", "audio")
         for widget in (self.play_button, self.position, self.volume, self.time_label):
             widget.setVisible(is_media)
+        self.position.set_markers([])
         self._update_mode_buttons()
         self.counted = False
         self.position.setValue(0)
@@ -570,6 +671,22 @@ class PlayerWidget(QWidget):
         self.seeking = False
         self.player.setPosition(self.position.value())
 
+    def request_bookmark(self) -> None:
+        if (self.allow_bookmarks and not self.mini_window and self.loaded_item
+                and self.loaded_item["kind"] == "video"):
+            self.bookmark_requested.emit(self.player.position())
+
+    def set_markers(self, markers: list[tuple[int, str]]) -> None:
+        self.position.set_markers(markers)
+
+    def seek_to(self, ms: int, play: bool = True) -> None:
+        """Salta a un momento (por ejemplo, un favorito) y sigue reproduciendo."""
+        self.player.setPosition(max(ms, 0))
+        self.position.setValue(max(ms, 0))
+        if play and self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            self.player.play()
+        self.poke()
+
     def toggle_fullscreen(self) -> None:
         """Como YouTube: la propia ventana ocupa la pantalla y solo queda el reproductor.
 
@@ -592,6 +709,7 @@ class PlayerWidget(QWidget):
         self.mini_button.setVisible(video and self.allow_mini)
         self.mini_button.setToolTip("Volver a Mikoshi (I o doble clic)" if mini else "Minirreproductor (I)")
         self.close_mini_button.setVisible(mini)
+        self.bookmark_button.setVisible(video and self.allow_bookmarks and not mini)
         # En la ventanita no cabe todo: el volumen se queda, sin la palabra «Vol.».
         self.volume_label.setVisible(not mini)
         self.volume.setFixedWidth(70 if mini else 100)

@@ -997,15 +997,16 @@ def test_shuffle_reorders_up_next_on_every_click(window):
     favorites = favorites_with_root(window)
     videos = list(favorites.model.items)
     favorites.watch(videos, 0)
-    # Cinco vídeos por delante, para que haya muchos órdenes posibles.
-    favorites.player.items = [videos[0]] + [dict(videos[1], id=1000 + n) for n in range(5)]
+    # Seis vídeos más en la carpeta, para que haya muchos órdenes posibles.
+    favorites.videos = videos + [dict(videos[1], id=1000 + n) for n in range(5)]
     assert not favorites.shuffle_button.isCheckable()
+    favorites.shuffle_button.click()
     orders = [[v["id"] for v in favorites.player.items[1:]]]
     for _click in range(5):
         favorites.shuffle_button.click()
         assert favorites.player.items[0]["id"] == videos[0]["id"]
         order = [v["id"] for v in favorites.player.items[1:]]
-        assert sorted(order) == sorted(orders[0])
+        assert sorted(order) == sorted(v["id"] for v in favorites.videos[1:])
         assert order != orders[-1]
         assert favorites.up_next.item(0).text() == titles([favorites.player.items[1]])[0]
         orders.append(order)
@@ -1098,3 +1099,72 @@ def test_mini_window_resizes_from_its_edges(app):
     assert mini._edges(QPointF(398, 238)) == Qt.Edge.RightEdge | Qt.Edge.BottomEdge
     assert mini._edges(QPointF(200, 120)) == Qt.Edge(0)
     mini.deleteLater()
+
+
+def test_shuffle_from_last_video_brings_whole_folder(window):
+    favorites = favorites_with_root(window)
+    videos = list(favorites.model.items)
+    favorites.videos = videos + [dict(videos[0], id=2000 + n) for n in range(4)]
+    favorites.watch(videos, len(videos) - 1)
+    assert favorites.up_next.count() == 0  # era el último: no quedaba nada detrás
+    favorites.shuffle_button.click()
+    current = videos[-1]["id"]
+    assert favorites.player.item["id"] == current
+    assert sorted(v["id"] for v in favorites.player.items) == sorted(v["id"] for v in favorites.videos)
+    assert favorites.up_next.count() == len(favorites.videos) - 1
+    assert favorites.player.next_button.isEnabled()
+    favorites._back()
+
+
+def test_favorite_moments_with_star(window, monkeypatch):
+    favorites = favorites_with_root(window)
+    monkeypatch.setattr(favorites, "ask_resume", lambda item, ms: False)
+    favorites.watch(favorites.model.items, 0)
+    wait_until(lambda: favorites.player.player.duration() > 0)
+    player = favorites.player
+    assert player.bookmark_button.isVisibleTo(player)
+    assert favorites.moment_button.isEnabled()
+    assert not favorites.moments.isVisibleTo(favorites)
+    notes = iter(["me encanta esta parte", "", "otra más"])
+    monkeypatch.setattr(favorites, "ask_note", lambda *a, **k: next(notes))
+    for ms in (1500, 300, 900):
+        player.player.setPosition(ms)
+        wait_until(lambda: abs(player.player.position() - ms) < 200)
+        player.bookmark_button.click()
+    item_id = player.item["id"]
+    saved = window.catalog.bookmarks(item_id)
+    assert len(saved) == 3
+    assert [m["note"] for m in saved] == ["", "otra más", "me encanta esta parte"]
+    assert favorites.moments.count() == 3
+    assert favorites.moments.isVisibleTo(favorites)
+    assert "Sin nota" in favorites.moments.item(0).text()
+    assert favorites.moments.item(2).text().endswith("me encanta esta parte")
+    assert "(3)" in favorites.moments_title.text()
+    # Las estrellas también salen en la barra del reproductor.
+    assert [ms for ms, _ in player.position.markers] == [m["position_ms"] for m in saved]
+    slider = player.position
+    slider.resize(400, 24)
+    star = saved[2]
+    assert slider.marker_at(slider.x_of(star["position_ms"])) == (star["position_ms"], star["note"])
+    assert not slider.grab().isNull()
+    # Clic en un momento de la lista: el vídeo va ahí.
+    favorites.moments.itemClicked.emit(favorites.moments.item(0))
+    wait_until(lambda: abs(player.player.position() - saved[0]["position_ms"]) < 300)
+    # Editar y borrar.
+    monkeypatch.setattr(favorites, "ask_note", lambda *a, **k: "nueva nota")
+    favorites.edit_moment(saved[0])
+    assert window.catalog.bookmarks(item_id)[0]["note"] == "nueva nota"
+    favorites.delete_moment(saved[1])
+    assert favorites.moments.count() == 2
+    assert len(player.position.markers) == 2
+    # Cancelar la nota no guarda nada.
+    monkeypatch.setattr(favorites, "ask_note", lambda *a, **k: None)
+    player.request_bookmark()
+    assert len(window.catalog.bookmarks(item_id)) == 2
+    # Otro vídeo: sus propios momentos (ninguno).
+    player.go(1)
+    assert favorites.moments.count() == 0
+    assert player.position.markers == []
+    player.go(-1)
+    assert favorites.moments.count() == 2
+    favorites._back()
